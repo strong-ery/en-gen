@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "engen-core",
+    "engen-audio",
+    "engen-ui",
+]
+resolver = "2"
