@@ -161,8 +161,8 @@ impl Tube {
             right_bc,
             left_boundary_flux: [0.0; 3],
             right_boundary_flux: [0.0; 3],
-            left_last_r_out: 0.0,
-            right_last_r_out: 0.0,
+            left_last_r_out: atmospheric_r_plus(1.4),
+            right_last_r_out: atmospheric_r_minus(1.4),
             left_last_mass_flow: 0.0,
             right_last_mass_flow: 0.0,
             u_temp: Vec::new(),
@@ -180,14 +180,19 @@ impl Tube {
         tube
     }
 
+    /// Quiescent-atmosphere R+ invariant stored at a left open/valve end.
+    pub fn reset_reflection_filters(&mut self) {
+        self.left_last_r_out = atmospheric_r_plus(1.4);
+        self.right_last_r_out = atmospheric_r_minus(1.4);
+    }
+
     pub fn reset_state(&mut self) {
         let w_init = [RHO_ATM, 0.0, P_ATM];
         let u_init = primitive_to_conserved(&w_init, 1.4);
         self.u = vec![u_init; self.num_cells + 2];
         self.left_boundary_flux = [0.0; 3];
         self.right_boundary_flux = [0.0; 3];
-        self.left_last_r_out = 0.0;
-        self.right_last_r_out = 0.0;
+        self.reset_reflection_filters();
         self.left_last_mass_flow = 0.0;
         self.right_last_mass_flow = 0.0;
         
@@ -295,6 +300,59 @@ pub const P_ATM: f32 = 101325.0; // Pa
 pub const T_ATM: f32 = 293.15;   // K
 pub const R_AIR: f32 = 287.05;   // J/(kg*K)
 pub const RHO_ATM: f32 = P_ATM / (R_AIR * T_ATM);
+
+fn atmospheric_sound_speed(gamma: f32) -> f32 {
+    (gamma * R_AIR * T_ATM).sqrt()
+}
+
+/// R+ invariant at a quiescent open boundary (v=0, c=c_res).
+fn atmospheric_r_plus(gamma: f32) -> f32 {
+    2.0 * atmospheric_sound_speed(gamma) / (gamma - 1.0)
+}
+
+/// R- invariant at a quiescent open boundary (v=0, c=c_res).
+fn atmospheric_r_minus(gamma: f32) -> f32 {
+    -atmospheric_r_plus(gamma)
+}
+
+/// Build a ghost-cell primitive state from filtered Riemann invariants.
+/// Thermodynamics are tied to c_ghost via isentropic relations from the reservoir.
+fn ghost_from_riemann(r_plus: f32, r_minus: f32, _gamma: f32, c_res: f32) -> [f32; 3] {
+    let v_ghost = 0.5 * (r_plus + r_minus);
+    let c_ghost = (0.1 * (r_plus - r_minus)).max(1.0);
+    let rho_ghost = RHO_ATM * (c_ghost / c_res).powf(5.0);
+    let p_ghost = P_ATM * (c_ghost / c_res).powf(7.0);
+    [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)]
+}
+
+fn smoothstep01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 0 = quiescent atmosphere, 1 = fully active Benson/open-port coupling.
+fn open_bc_activity(w: &[f32; 3]) -> f32 {
+    let p_rel = ((w[2] - P_ATM).abs() / 3000.0).min(1.0);
+    let v_rel = (w[1].abs() / 10.0).min(1.0);
+    let raw = p_rel.max(v_rel);
+    if raw < 0.03 {
+        return 0.0;
+    }
+    smoothstep01(((raw - 0.03) / 0.97).min(1.0))
+}
+
+fn lerp_primitive(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    let s = 1.0 - t;
+    [a[0] * s + b[0] * t, a[1] * s + b[1] * t, a[2] * s + b[2] * t]
+}
+
+fn is_radiating_open_bc(bc: BoundaryType) -> bool {
+    match bc {
+        BoundaryType::Open => true,
+        BoundaryType::Valve { lift } => lift > 1e-4,
+        BoundaryType::Closed => false,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Solver {
@@ -509,35 +567,33 @@ impl Solver {
             tube.left_boundary_flux = left_flux;
             tube.right_boundary_flux = right_flux;
             
-            // Check Left End
             let connected_left = self.junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube.id && c.side == TubeSide::Left));
-            if !connected_left {
-                let is_open = match tube.left_bc {
-                    BoundaryType::Open => true,
-                    BoundaryType::Valve { lift } => lift > 1e-4,
-                    BoundaryType::Closed => false,
-                };
-                if is_open {
-                    let w1 = conserved_to_primitive(&tube.u[1], gamma);
-                    let mass_flow = -w1[0] * w1[1] * tube.area[1];
-                    let dmdt = (mass_flow - initial_mass_flows[k].0) / dt;
-                    net_jones += dmdt;
-                }
-            }
-            
-            // Check Right End
             let connected_right = self.junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube.id && c.side == TubeSide::Right));
-            if !connected_right {
-                let is_open = match tube.right_bc {
-                    BoundaryType::Open => true,
-                    BoundaryType::Valve { lift } => lift > 1e-4,
-                    BoundaryType::Closed => false,
-                };
-                if is_open {
-                    let wm = conserved_to_primitive(&tube.u[tube.num_cells], gamma);
-                    let mass_flow = wm[0] * wm[1] * tube.area[tube.num_cells];
-                    let dmdt = (mass_flow - initial_mass_flows[k].1) / dt;
-                    net_jones += dmdt;
+            let left_open = !connected_left && is_radiating_open_bc(tube.left_bc);
+            let right_open = !connected_right && is_radiating_open_bc(tube.right_bc);
+
+            let mut left_flow = 0.0;
+            let mut right_flow = 0.0;
+            if left_open {
+                let w1 = conserved_to_primitive(&tube.u[1], gamma);
+                left_flow = -w1[0] * w1[1] * tube.area[1];
+            }
+            if right_open {
+                let wm = conserved_to_primitive(&tube.u[tube.num_cells], gamma);
+                right_flow = wm[0] * wm[1] * tube.area[tube.num_cells];
+            }
+
+            if left_open && right_open {
+                // Net boundary mass flux avoids catastrophic cancellation between endpoints.
+                let net_flow = left_flow + right_flow;
+                let net_initial = initial_mass_flows[k].0 + initial_mass_flows[k].1;
+                net_jones += (net_flow - net_initial) / dt;
+            } else {
+                if left_open {
+                    net_jones += (left_flow - initial_mass_flows[k].0) / dt;
+                }
+                if right_open {
+                    net_jones += (right_flow - initial_mass_flows[k].1) / dt;
                 }
             }
         }
@@ -677,6 +733,84 @@ impl Solver {
         Self::apply_network_bc(&mut self.tubes, &self.junctions, false, &self.junctions, gamma, filter_strength);
     }
 
+    fn open_left_ghost(
+        w1: [f32; 3],
+        gamma: f32,
+        c_res: f32,
+        filter_strength: f32,
+        lift: f32,
+        last_r_out: f32,
+    ) -> ([f32; 3], f32) {
+        let w_atm = [RHO_ATM, 0.0, P_ATM];
+        let r_atm = atmospheric_r_plus(gamma);
+        let activity = open_bc_activity(&w1);
+        if activity <= 0.0 {
+            return (w_atm, r_atm);
+        }
+
+        let r_minus = w1[1] - 2.0 * (gamma * w1[2] / w1[0]).sqrt() / (gamma - 1.0);
+        let r_in = atmospheric_r_plus(gamma);
+        let c1 = (gamma * w1[2] / w1[0]).sqrt();
+        let v_out = Self::solve_bisection_valve(r_in, w1[2], w1[0], c1, lift, c_res);
+        let c_bc = 0.2 * (r_in - v_out);
+        let r_plus_reflected = (-v_out) + 2.0 * c_bc / (gamma - 1.0);
+        let alpha = if (lift - 1.0).abs() < 1e-4 {
+            filter_strength
+        } else {
+            1.0 - (1.0 - filter_strength) * lift
+        };
+        let r_out_filtered = alpha * r_plus_reflected + (1.0 - alpha) * last_r_out;
+        let w_benson = ghost_from_riemann(r_out_filtered, r_minus, gamma, c_res);
+
+        if activity >= 1.0 {
+            (w_benson, r_out_filtered)
+        } else {
+            (
+                lerp_primitive(w_atm, w_benson, activity),
+                r_atm * (1.0 - activity) + r_out_filtered * activity,
+            )
+        }
+    }
+
+    fn open_right_ghost(
+        wm: [f32; 3],
+        gamma: f32,
+        c_res: f32,
+        filter_strength: f32,
+        lift: f32,
+        last_r_out: f32,
+    ) -> ([f32; 3], f32) {
+        let w_atm = [RHO_ATM, 0.0, P_ATM];
+        let r_atm = atmospheric_r_minus(gamma);
+        let activity = open_bc_activity(&wm);
+        if activity <= 0.0 {
+            return (w_atm, r_atm);
+        }
+
+        let r_plus = wm[1] + 2.0 * (gamma * wm[2] / wm[0]).sqrt() / (gamma - 1.0);
+        let r_in = atmospheric_r_plus(gamma);
+        let cm = (gamma * wm[2] / wm[0]).sqrt();
+        let v_out = Self::solve_bisection_valve(r_in, wm[2], wm[0], cm, lift, c_res);
+        let c_bc = 0.2 * (r_in - v_out);
+        let r_minus_reflected = v_out - 2.0 * c_bc / (gamma - 1.0);
+        let alpha = if (lift - 1.0).abs() < 1e-4 {
+            filter_strength
+        } else {
+            1.0 - (1.0 - filter_strength) * lift
+        };
+        let r_out_filtered = alpha * r_minus_reflected + (1.0 - alpha) * last_r_out;
+        let w_benson = ghost_from_riemann(r_plus, r_out_filtered, gamma, c_res);
+
+        if activity >= 1.0 {
+            (w_benson, r_out_filtered)
+        } else {
+            (
+                lerp_primitive(w_atm, w_benson, activity),
+                r_atm * (1.0 - activity) + r_out_filtered * activity,
+            )
+        }
+    }
+
     #[allow(non_snake_case)]
     fn apply_network_bc(
         tubes: &mut Vec<Tube>,
@@ -686,16 +820,25 @@ impl Solver {
         gamma: f32,
         filter_strength: f32,
     ) {
-        let c_res = (gamma * 287.05 * T_ATM).sqrt(); // Stagnation speed of sound at atmospheric reservoir
+        let c_res = atmospheric_sound_speed(gamma);
         
         for k in 0..tubes.len() {
             let m = tubes[k].num_cells;
             let id = tubes[k].id;
             let left_bc = tubes[k].left_bc;
             let right_bc = tubes[k].right_bc;
+            let connected_left = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == id && c.side == TubeSide::Left));
+            let connected_right = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == id && c.side == TubeSide::Right));
+            let left_radiating = !connected_left && is_radiating_open_bc(left_bc);
+            let right_radiating = !connected_right && is_radiating_open_bc(right_bc);
+            // Dual-open ends form a resonant cavity; absorb reflections more aggressively at idle.
+            let tube_filter = if left_radiating && right_radiating {
+                filter_strength.max(0.94)
+            } else {
+                filter_strength
+            };
             
             // 1. Check Left End
-            let connected_left = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == id && c.side == TubeSide::Left));
             if !connected_left {
                 let w1 = {
                     let state = if use_temp { &tubes[k].u_temp } else { &tubes[k].u };
@@ -713,29 +856,9 @@ impl Solver {
                         new_r_out = Some(r_wall);
                     }
                     BoundaryType::Open => {
-                        let R_minus = w1[1] - 2.0 * (gamma * w1[2] / w1[0]).sqrt() / (gamma - 1.0);
-                        let R_in = -R_minus;
-                        let v_out = Self::solve_bisection_valve(R_in, w1[2], w1[0], (gamma * w1[2] / w1[0]).sqrt(), 1.0, c_res);
-                        let c_bc = 0.2 * (R_in - v_out);
-                        let v_bc = -v_out;
-                        
-                        let R_plus_reflected = v_bc + 2.0 * c_bc / (gamma - 1.0);
-                        let alpha = filter_strength;
-                        let last_r_out = tubes[k].left_last_r_out;
-                        let r_out_filtered = alpha * R_plus_reflected + (1.0 - alpha) * last_r_out;
-                        new_r_out = Some(r_out_filtered);
-                        
-                        let v_ghost = 0.5 * (r_out_filtered + R_minus);
-                        let c_ghost = (0.1 * (r_out_filtered - R_minus)).max(0.5 * c_res);
-                        
-                        let (rho_ghost, p_ghost) = if v_out >= 0.0 {
-                            (w1[0] * (c_ghost / (gamma * w1[2] / w1[0]).sqrt()).powf(5.0),
-                             w1[2] * (c_ghost / (gamma * w1[2] / w1[0]).sqrt()).powf(7.0))
-                        } else {
-                            (RHO_ATM * (c_ghost / c_res).powf(5.0),
-                             P_ATM * (c_ghost / c_res).powf(7.0))
-                        };
-                        w0 = [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)];
+                        let (ghost, r_out) = Self::open_left_ghost(w1, gamma, c_res, tube_filter, 1.0, tubes[k].left_last_r_out);
+                        w0 = ghost;
+                        new_r_out = Some(r_out);
                     }
                     BoundaryType::Valve { lift } => {
                         if lift < 1e-4 {
@@ -744,29 +867,9 @@ impl Solver {
                             let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
                             new_r_out = Some(r_wall);
                         } else {
-                            let R_minus = w1[1] - 2.0 * (gamma * w1[2] / w1[0]).sqrt() / (gamma - 1.0);
-                            let R_in = -R_minus;
-                            let v_out = Self::solve_bisection_valve(R_in, w1[2], w1[0], (gamma * w1[2] / w1[0]).sqrt(), lift, c_res);
-                            let c_bc = 0.2 * (R_in - v_out);
-                            let v_bc = -v_out;
-                            
-                            let R_plus_reflected = v_bc + 2.0 * c_bc / (gamma - 1.0);
-                            let alpha = 1.0 - (1.0 - filter_strength) * lift;
-                            let last_r_out = tubes[k].left_last_r_out;
-                            let r_out_filtered = alpha * R_plus_reflected + (1.0 - alpha) * last_r_out;
-                            new_r_out = Some(r_out_filtered);
-                            
-                            let v_ghost = 0.5 * (r_out_filtered + R_minus);
-                            let c_ghost = (0.1 * (r_out_filtered - R_minus)).max(0.5 * c_res);
-                            
-                            let (rho_ghost, p_ghost) = if v_out >= 0.0 {
-                                (w1[0] * (c_ghost / (gamma * w1[2] / w1[0]).sqrt()).powf(5.0),
-                                 w1[2] * (c_ghost / (gamma * w1[2] / w1[0]).sqrt()).powf(7.0))
-                            } else {
-                                (RHO_ATM * (c_ghost / c_res).powf(5.0),
-                                 P_ATM * (c_ghost / c_res).powf(7.0))
-                            };
-                            w0 = [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)];
+                            let (ghost, r_out) = Self::open_left_ghost(w1, gamma, c_res, tube_filter, lift, tubes[k].left_last_r_out);
+                            w0 = ghost;
+                            new_r_out = Some(r_out);
                         }
                     }
                 }
@@ -779,7 +882,6 @@ impl Solver {
             }
             
             // 2. Check Right End
-            let connected_right = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == id && c.side == TubeSide::Right));
             if !connected_right {
                 let wm = {
                     let state = if use_temp { &tubes[k].u_temp } else { &tubes[k].u };
@@ -797,29 +899,9 @@ impl Solver {
                         new_r_out = Some(r_wall);
                     }
                     BoundaryType::Open => {
-                        let R_plus = wm[1] + 2.0 * (gamma * wm[2] / wm[0]).sqrt() / (gamma - 1.0);
-                        let R_in = R_plus;
-                        let v_out = Self::solve_bisection_valve(R_in, wm[2], wm[0], (gamma * wm[2] / wm[0]).sqrt(), 1.0, c_res);
-                        let c_bc = 0.2 * (R_in - v_out);
-                        let v_bc = v_out;
-                        
-                        let R_minus_reflected = v_bc - 2.0 * c_bc / (gamma - 1.0);
-                        let alpha = filter_strength;
-                        let last_r_out = tubes[k].right_last_r_out;
-                        let r_out_filtered = alpha * R_minus_reflected + (1.0 - alpha) * last_r_out;
-                        new_r_out = Some(r_out_filtered);
-                        
-                        let v_ghost = 0.5 * (R_plus + r_out_filtered);
-                        let c_ghost = (0.1 * (R_plus - r_out_filtered)).max(0.5 * c_res);
-                        
-                        let (rho_ghost, p_ghost) = if v_out >= 0.0 {
-                            (wm[0] * (c_ghost / (gamma * wm[2] / wm[0]).sqrt()).powf(5.0),
-                             wm[2] * (c_ghost / (gamma * wm[2] / wm[0]).sqrt()).powf(7.0))
-                        } else {
-                            (RHO_ATM * (c_ghost / c_res).powf(5.0),
-                             P_ATM * (c_ghost / c_res).powf(7.0))
-                        };
-                        w_m1 = [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)];
+                        let (ghost, r_out) = Self::open_right_ghost(wm, gamma, c_res, tube_filter, 1.0, tubes[k].right_last_r_out);
+                        w_m1 = ghost;
+                        new_r_out = Some(r_out);
                     }
                     BoundaryType::Valve { lift } => {
                         if lift < 1e-4 {
@@ -828,28 +910,9 @@ impl Solver {
                             let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
                             new_r_out = Some(r_wall);
                         } else {
-                            let R_plus = wm[1] + 2.0 * (gamma * wm[2] / wm[0]).sqrt() / (gamma - 1.0);
-                            let R_in = R_plus;
-                            let v_out = Self::solve_bisection_valve(R_in, wm[2], wm[0], (gamma * wm[2] / wm[0]).sqrt(), lift, c_res);
-                            let c_bc = 0.2 * (R_in - v_out);
-                            let v_bc = v_out;
-                            
-                            let R_minus_reflected = v_bc - 2.0 * c_bc / (gamma - 1.0);
-                            let alpha = 1.0 - (1.0 - filter_strength) * lift;
-                            let r_out_filtered = alpha * R_minus_reflected + (1.0 - alpha) * tubes[k].right_last_r_out;
-                            new_r_out = Some(r_out_filtered);
-                            
-                            let v_ghost = 0.5 * (R_plus + r_out_filtered);
-                            let c_ghost = (0.1 * (R_plus - r_out_filtered)).max(0.5 * c_res);
-                            
-                            let (rho_ghost, p_ghost) = if v_out >= 0.0 {
-                                (wm[0] * (c_ghost / (gamma * wm[2] / wm[0]).sqrt()).powf(5.0),
-                                 wm[2] * (c_ghost / (gamma * wm[2] / wm[0]).sqrt()).powf(7.0))
-                            } else {
-                                (RHO_ATM * (c_ghost / c_res).powf(5.0),
-                                 P_ATM * (c_ghost / c_res).powf(7.0))
-                            };
-                            w_m1 = [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)];
+                            let (ghost, r_out) = Self::open_right_ghost(wm, gamma, c_res, tube_filter, lift, tubes[k].right_last_r_out);
+                            w_m1 = ghost;
+                            new_r_out = Some(r_out);
                         }
                     }
                 }
@@ -907,7 +970,8 @@ impl Solver {
             
             let p_bc = p_interior * (c_bc / c_int).powf(7.0);
             
-            if p_bc >= P_ATM {
+            // Small hysteresis band avoids inflow/outflow branch chatter near atmospheric pressure.
+            if p_bc >= P_ATM - 25.0 {
                 // Outflow: gas leaves pipe, expands into reservoir
                 let pr = P_ATM / p_bc.max(1e-3);
                 let phi = if pr <= 0.52828 {
@@ -1258,6 +1322,32 @@ mod tests {
                 assert!(!cell[2].is_nan());
             }
         }
+    }
+
+    #[test]
+    fn test_open_open_quiescent_jones() {
+        let mut solver = Solver::new_single_tube(RadiusProfile::Linear, BoundaryType::Open, BoundaryType::Open);
+        solver.friction = 15.0;
+        solver.heat_transfer = 2.0;
+
+        let sim_dt = 1.0 / 64000.0;
+        let mut max_jones = 0.0f32;
+        let mut max_velocity = 0.0f32;
+
+        for _ in 0..8000 {
+            let jones_val = solver.step(sim_dt);
+            max_jones = max_jones.max(jones_val.abs());
+
+            for tube in &solver.tubes {
+                for i in 1..=tube.num_cells {
+                    let w = conserved_to_primitive(&tube.u[i], 1.4);
+                    max_velocity = max_velocity.max(w[1].abs());
+                }
+            }
+        }
+
+        assert!(max_jones < 5.0, "Quiescent Jones noise too high: {}", max_jones);
+        assert!(max_velocity < 5.0, "Quiescent velocity drift too high: {}", max_velocity);
     }
 
     #[test]

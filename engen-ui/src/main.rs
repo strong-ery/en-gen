@@ -1135,7 +1135,7 @@ fn main() -> eframe::Result<()> {
         time: 0.0,
         limiter: LimiterType::VanLeer,
         friction: 15.0,
-        heat_transfer: 50.0,
+        heat_transfer: 2.0,
         speed_multiplier: 1.0,
         inject_pulse: false,
         pulse_amplitude: 20000.0,
