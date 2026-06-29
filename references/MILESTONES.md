@@ -13,7 +13,7 @@ Single fixed-width tube, atmosphere BCs, pressure pulse injected at t=0. Live eg
 
 ---
 
-## Milestone 2 — Tube Junctions & Variable Geometry
+## ✅ Milestone 2 — Tube Junctions & Variable Geometry
 **Goal:** Confirm pressure waves propagate correctly through geometry changes and multi-tube networks.
 
 - Variable cross-sectional area along a single tube (taper, bell mouth, expansion chamber)
