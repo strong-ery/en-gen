@@ -21,10 +21,11 @@ impl fmt::Display for LimiterType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BoundaryType {
     Closed, // Rigid reflecting wall
     Open,   // Atmospheric boundary
+    Valve { lift: f32 },
 }
 
 impl fmt::Display for BoundaryType {
@@ -32,6 +33,7 @@ impl fmt::Display for BoundaryType {
         match self {
             BoundaryType::Closed => write!(f, "Closed (Wall)"),
             BoundaryType::Open => write!(f, "Open (Atmosphere)"),
+            BoundaryType::Valve { lift } => write!(f, "Valve (Lift: {:.2})", lift),
         }
     }
 }
@@ -101,6 +103,21 @@ pub struct Tube {
     pub left_boundary_flux: [f32; 3],
     pub right_boundary_flux: [f32; 3],
     
+    // Reflection filter variables
+    pub left_last_r_out: f32,
+    pub right_last_r_out: f32,
+    
+    // Jones mass flow derivative variables
+    pub left_last_mass_flow: f32,
+    pub right_last_mass_flow: f32,
+    
+    // Pre-allocated temporary workspaces for solver to avoid heap allocations in hot path
+    pub u_temp: Vec<[f32; 3]>,
+    pub w: Vec<[f32; 3]>,
+    pub slopes: Vec<[f32; 3]>,
+    pub fluxes: Vec<[f32; 3]>,
+    pub rhs: Vec<[f32; 3]>,
+    
     // Pre-calculated 2D graphics vectors for rendering the heatmap layout
     pub cell_centers_2d: Vec<[f32; 2]>,
     pub cell_tangents_2d: Vec<[f32; 2]>,
@@ -144,6 +161,15 @@ impl Tube {
             right_bc,
             left_boundary_flux: [0.0; 3],
             right_boundary_flux: [0.0; 3],
+            left_last_r_out: 0.0,
+            right_last_r_out: 0.0,
+            left_last_mass_flow: 0.0,
+            right_last_mass_flow: 0.0,
+            u_temp: Vec::new(),
+            w: Vec::new(),
+            slopes: Vec::new(),
+            fluxes: Vec::new(),
+            rhs: Vec::new(),
             cell_centers_2d: Vec::new(),
             cell_tangents_2d: Vec::new(),
             cell_boundaries_left_2d: Vec::new(),
@@ -160,6 +186,17 @@ impl Tube {
         self.u = vec![u_init; self.num_cells + 2];
         self.left_boundary_flux = [0.0; 3];
         self.right_boundary_flux = [0.0; 3];
+        self.left_last_r_out = 0.0;
+        self.right_last_r_out = 0.0;
+        self.left_last_mass_flow = 0.0;
+        self.right_last_mass_flow = 0.0;
+        
+        // Reset temporary workspaces
+        for x in &mut self.u_temp { *x = [0.0; 3]; }
+        for x in &mut self.w { *x = [0.0; 3]; }
+        for x in &mut self.slopes { *x = [0.0; 3]; }
+        for x in &mut self.fluxes { *x = [0.0; 3]; }
+        for x in &mut self.rhs { *x = [0.0; 3]; }
     }
 
     pub fn get_radius_at(&self, t: f32) -> f32 {
@@ -186,6 +223,13 @@ impl Tube {
 
         self.area = vec![0.0; m + 2];
         self.dadx = vec![0.0; m + 2];
+        
+        // Resize temporary workspaces
+        self.u_temp = vec![[0.0; 3]; m + 2];
+        self.w = vec![[0.0; 3]; m + 2];
+        self.slopes = vec![[0.0; 3]; m + 2];
+        self.fluxes = vec![[0.0; 3]; m + 1];
+        self.rhs = vec![[0.0; 3]; m + 2];
         
         self.cell_centers_2d = vec![[0.0; 2]; m + 1];
         self.cell_tangents_2d = vec![[0.0; 2]; m + 1];
@@ -258,7 +302,11 @@ pub struct Solver {
     pub junctions: Vec<Junction>,
     pub limiter: LimiterType,
     pub friction: f32,
+    pub heat_transfer: f32,
     pub t: f32,
+    pub reflection_filter: f32,
+    pub step_counter: usize,
+    pub cached_dt_stable: f32,
 }
 
 impl Solver {
@@ -282,9 +330,13 @@ impl Solver {
         Self {
             tubes: vec![tube],
             junctions: Vec::new(),
-            limiter: LimiterType::MC,
+            limiter: LimiterType::VanLeer,
             friction: 0.0,
+            heat_transfer: 0.0,
             t: 0.0,
+            reflection_filter: 0.75,
+            step_counter: 0,
+            cached_dt_stable: 0.0,
         }
     }
 
@@ -362,9 +414,13 @@ impl Solver {
         Self {
             tubes: vec![main_tube, branch_a, branch_b],
             junctions: vec![junction],
-            limiter: LimiterType::MC,
+            limiter: LimiterType::VanLeer,
             friction: 0.0,
+            heat_transfer: 0.0,
             t: 0.0,
+            reflection_filter: 0.75,
+            step_counter: 0,
+            cached_dt_stable: 0.0,
         }
     }
 
@@ -388,41 +444,135 @@ impl Solver {
         self.apply_boundary_conditions();
     }
 
-    pub fn step(&mut self, dt: f32) {
+    pub fn step(&mut self, dt: f32) -> f32 {
+        let gamma = 1.4;
+        
+        // 1. Calculate the maximum stable timestep based on CFL = 0.8
+        // Recalculate stable timestep every 16 steps or if first step
+        if self.step_counter % 16 == 0 || self.cached_dt_stable == 0.0 {
+            let mut max_speed = 10.0f32;
+            let mut min_dx = f32::MAX;
+            
+            for tube in &self.tubes {
+                min_dx = min_dx.min(tube.dx);
+                for i in 1..=tube.num_cells {
+                    let rho = tube.u[i][0].max(1e-4);
+                    let momentum = tube.u[i][1];
+                    let energy = tube.u[i][2];
+                    let velocity = (momentum / rho).abs();
+                    let kinetic = 0.5 * rho * velocity * velocity;
+                    let internal = (energy - kinetic).max(1e-4);
+                    let p = internal * (gamma - 1.0);
+                    let speed_of_sound = (gamma * p / rho).sqrt();
+                    max_speed = max_speed.max(velocity + speed_of_sound);
+                }
+            }
+            
+            let cfl = 0.8f32;
+            self.cached_dt_stable = cfl * (min_dx / max_speed);
+        }
+        
+        self.step_counter += 1;
+        let dt_stable = self.cached_dt_stable;
+        
+        // Determine number of sub-steps
+        let n_steps = (dt / dt_stable).ceil().max(1.0) as usize;
+        let sub_dt = dt / n_steps as f32;
+        
+        // Store starting mass flows for correct derivative calculation over the full dt
+        let mut initial_mass_flows = Vec::with_capacity(self.tubes.len());
+        for tube in &self.tubes {
+            let left_flow = {
+                let w1 = conserved_to_primitive(&tube.u[1], gamma);
+                -w1[0] * w1[1] * tube.area[1]
+            };
+            let right_flow = {
+                let wm = conserved_to_primitive(&tube.u[tube.num_cells], gamma);
+                wm[0] * wm[1] * tube.area[tube.num_cells]
+            };
+            initial_mass_flows.push((left_flow, right_flow));
+        }
+        
+        // Evolve system by sub-stepping
+        for _ in 0..n_steps {
+            self.single_substep(sub_dt);
+        }
+        
+        // Compute final fluxes and calculate net Jones dP/dt
+        let mut net_jones = 0.0;
+        let limiter = self.limiter;
+        let friction = self.friction;
+        let heat_transfer = self.heat_transfer;
+        
+        for (k, tube) in self.tubes.iter_mut().enumerate() {
+            let (left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, false);
+            tube.left_boundary_flux = left_flux;
+            tube.right_boundary_flux = right_flux;
+            
+            // Check Left End
+            let connected_left = self.junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube.id && c.side == TubeSide::Left));
+            if !connected_left {
+                let is_open = match tube.left_bc {
+                    BoundaryType::Open => true,
+                    BoundaryType::Valve { lift } => lift > 1e-4,
+                    BoundaryType::Closed => false,
+                };
+                if is_open {
+                    let w1 = conserved_to_primitive(&tube.u[1], gamma);
+                    let mass_flow = -w1[0] * w1[1] * tube.area[1];
+                    let dmdt = (mass_flow - initial_mass_flows[k].0) / dt;
+                    net_jones += dmdt;
+                }
+            }
+            
+            // Check Right End
+            let connected_right = self.junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube.id && c.side == TubeSide::Right));
+            if !connected_right {
+                let is_open = match tube.right_bc {
+                    BoundaryType::Open => true,
+                    BoundaryType::Valve { lift } => lift > 1e-4,
+                    BoundaryType::Closed => false,
+                };
+                if is_open {
+                    let wm = conserved_to_primitive(&tube.u[tube.num_cells], gamma);
+                    let mass_flow = wm[0] * wm[1] * tube.area[tube.num_cells];
+                    let dmdt = (mass_flow - initial_mass_flows[k].1) / dt;
+                    net_jones += dmdt;
+                }
+            }
+        }
+        
+        net_jones
+    }
+
+    fn single_substep(&mut self, dt: f32) {
         let gamma = 1.4;
         let num_tubes = self.tubes.len();
 
         // ------------------ SSP-RK2 Step 1 ------------------
         self.apply_boundary_conditions();
         
-        // Compute RHS and boundary fluxes for all tubes at u^n
-        let mut rhs1 = Vec::with_capacity(num_tubes);
         let mut step1_left_fluxes = Vec::with_capacity(num_tubes);
         let mut step1_right_fluxes = Vec::with_capacity(num_tubes);
         
         let limiter = self.limiter;
         let friction = self.friction;
+        let heat_transfer = self.heat_transfer;
 
-        for tube in &self.tubes {
-            let (rhs, left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, tube, &tube.u);
-            rhs1.push(rhs);
+        for tube in &mut self.tubes {
+            let (left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, false);
             step1_left_fluxes.push(left_flux);
             step1_right_fluxes.push(right_flux);
         }
 
-        // Temporary state storage u1
-        let mut u1 = Vec::with_capacity(num_tubes);
-        for (k, tube) in self.tubes.iter().enumerate() {
-            let mut u1_tube = tube.u.clone();
+        for tube in &mut self.tubes {
             for i in 1..=tube.num_cells {
                 for c in 0..3 {
-                    u1_tube[i][c] = tube.u[i][c] + dt * rhs1[k][i][c];
+                    tube.u_temp[i][c] = tube.u[i][c] + dt * tube.rhs[i][c];
                 }
             }
-            u1.push(u1_tube);
         }
 
-        // Evolve junctions to state 1
         let mut j1 = self.junctions.clone();
         for (j_idx, junction) in self.junctions.iter().enumerate() {
             let mut dmass = 0.0;
@@ -451,25 +601,22 @@ impl Solver {
         }
 
         // ------------------ SSP-RK2 Step 2 ------------------
-        // Apply BC on intermediate states u1 and j1
-        Self::apply_network_bc(&mut u1, &j1, &self.tubes, &self.junctions, gamma);
+        let filter_strength = self.reflection_filter;
+        Self::apply_network_bc(&mut self.tubes, &self.junctions, true, &j1, gamma, filter_strength);
         
-        let mut rhs2 = Vec::with_capacity(num_tubes);
         let mut step2_left_fluxes = Vec::with_capacity(num_tubes);
         let mut step2_right_fluxes = Vec::with_capacity(num_tubes);
         
-        for (k, tube) in self.tubes.iter().enumerate() {
-            let (rhs, left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, tube, &u1[k]);
-            rhs2.push(rhs);
+        for tube in &mut self.tubes {
+            let (left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, true);
             step2_left_fluxes.push(left_flux);
             step2_right_fluxes.push(right_flux);
         }
 
-        // Final state update
-        for (k, tube) in self.tubes.iter_mut().enumerate() {
+        for tube in &mut self.tubes {
             for i in 1..=tube.num_cells {
                 for c in 0..3 {
-                    tube.u[i][c] = 0.5 * tube.u[i][c] + 0.5 * u1[k][i][c] + 0.5 * dt * rhs2[k][i][c];
+                    tube.u[i][c] = 0.5 * tube.u[i][c] + 0.5 * tube.u_temp[i][c] + 0.5 * dt * tube.rhs[i][c];
                 }
             }
             
@@ -493,7 +640,6 @@ impl Solver {
             }
         }
 
-        // Update junctions to next timestep
         for (j_idx, junction) in self.junctions.iter_mut().enumerate() {
             let mut dmass = 0.0;
             let mut denergy = 0.0;
@@ -522,92 +668,217 @@ impl Solver {
 
         self.apply_boundary_conditions();
         
-        // Save the final boundary fluxes at the end of the step for UI queries
-        for tube in &mut self.tubes {
-            let (_, left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, tube, &tube.u);
-            tube.left_boundary_flux = left_flux;
-            tube.right_boundary_flux = right_flux;
-        }
-
         self.t += dt;
     }
 
     pub fn apply_boundary_conditions(&mut self) {
         let gamma = 1.4;
-        let mut u_temp = self.tubes.iter().map(|t| t.u.clone()).collect::<Vec<_>>();
-        Self::apply_network_bc(&mut u_temp, &self.junctions, &self.tubes, &self.junctions, gamma);
-        for (k, tube) in self.tubes.iter_mut().enumerate() {
-            tube.u = u_temp[k].clone();
-        }
+        let filter_strength = self.reflection_filter;
+        Self::apply_network_bc(&mut self.tubes, &self.junctions, false, &self.junctions, gamma, filter_strength);
     }
 
+    #[allow(non_snake_case)]
     fn apply_network_bc(
-        u_states: &mut Vec<Vec<[f32; 3]>>,
-        j_states: &Vec<Junction>,
-        tubes: &Vec<Tube>,
+        tubes: &mut Vec<Tube>,
         junctions: &Vec<Junction>,
+        use_temp: bool,
+        j_states: &Vec<Junction>,
         gamma: f32,
+        filter_strength: f32,
     ) {
-        // First set standard (non-connected) boundaries
-        for (k, tube) in tubes.iter().enumerate() {
-            let state = &mut u_states[k];
-            let m = tube.num_cells;
+        let c_res = (gamma * 287.05 * T_ATM).sqrt(); // Stagnation speed of sound at atmospheric reservoir
+        
+        for k in 0..tubes.len() {
+            let m = tubes[k].num_cells;
+            let id = tubes[k].id;
+            let left_bc = tubes[k].left_bc;
+            let right_bc = tubes[k].right_bc;
             
-            // Check Left End
-            let connected_left = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube.id && c.side == TubeSide::Left));
+            // 1. Check Left End
+            let connected_left = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == id && c.side == TubeSide::Left));
             if !connected_left {
-                match tube.left_bc {
+                let w1 = {
+                    let state = if use_temp { &tubes[k].u_temp } else { &tubes[k].u };
+                    conserved_to_primitive(&state[1], gamma)
+                };
+                
+                let w0;
+                let new_r_out;
+                
+                match left_bc {
                     BoundaryType::Closed => {
-                        let w1 = conserved_to_primitive(&state[1], gamma);
-                        let w0 = [w1[0], -w1[1], w1[2]];
-                        state[0] = primitive_to_conserved(&w0, gamma);
+                        w0 = [w1[0], -w1[1], w1[2]];
+                        let c1 = (gamma * w1[2] / w1[0]).sqrt();
+                        let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
+                        new_r_out = Some(r_wall);
                     }
                     BoundaryType::Open => {
-                        let w1 = conserved_to_primitive(&state[1], gamma);
-                        let rho0 = if w1[1] > 0.0 { RHO_ATM } else { w1[0] };
-                        let w0 = [rho0, w1[1], P_ATM];
-                        state[0] = primitive_to_conserved(&w0, gamma);
+                        let R_minus = w1[1] - 2.0 * (gamma * w1[2] / w1[0]).sqrt() / (gamma - 1.0);
+                        let R_in = -R_minus;
+                        let v_out = Self::solve_bisection_valve(R_in, w1[2], w1[0], (gamma * w1[2] / w1[0]).sqrt(), 1.0, c_res);
+                        let c_bc = 0.2 * (R_in - v_out);
+                        let v_bc = -v_out;
+                        
+                        let R_plus_reflected = v_bc + 2.0 * c_bc / (gamma - 1.0);
+                        let alpha = filter_strength;
+                        let last_r_out = tubes[k].left_last_r_out;
+                        let r_out_filtered = alpha * R_plus_reflected + (1.0 - alpha) * last_r_out;
+                        new_r_out = Some(r_out_filtered);
+                        
+                        let v_ghost = 0.5 * (r_out_filtered + R_minus);
+                        let c_ghost = (0.1 * (r_out_filtered - R_minus)).max(0.5 * c_res);
+                        
+                        let (rho_ghost, p_ghost) = if v_out >= 0.0 {
+                            (w1[0] * (c_ghost / (gamma * w1[2] / w1[0]).sqrt()).powf(5.0),
+                             w1[2] * (c_ghost / (gamma * w1[2] / w1[0]).sqrt()).powf(7.0))
+                        } else {
+                            (RHO_ATM * (c_ghost / c_res).powf(5.0),
+                             P_ATM * (c_ghost / c_res).powf(7.0))
+                        };
+                        w0 = [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)];
+                    }
+                    BoundaryType::Valve { lift } => {
+                        if lift < 1e-4 {
+                            w0 = [w1[0], -w1[1], w1[2]];
+                            let c1 = (gamma * w1[2] / w1[0]).sqrt();
+                            let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
+                            new_r_out = Some(r_wall);
+                        } else {
+                            let R_minus = w1[1] - 2.0 * (gamma * w1[2] / w1[0]).sqrt() / (gamma - 1.0);
+                            let R_in = -R_minus;
+                            let v_out = Self::solve_bisection_valve(R_in, w1[2], w1[0], (gamma * w1[2] / w1[0]).sqrt(), lift, c_res);
+                            let c_bc = 0.2 * (R_in - v_out);
+                            let v_bc = -v_out;
+                            
+                            let R_plus_reflected = v_bc + 2.0 * c_bc / (gamma - 1.0);
+                            let alpha = 1.0 - (1.0 - filter_strength) * lift;
+                            let last_r_out = tubes[k].left_last_r_out;
+                            let r_out_filtered = alpha * R_plus_reflected + (1.0 - alpha) * last_r_out;
+                            new_r_out = Some(r_out_filtered);
+                            
+                            let v_ghost = 0.5 * (r_out_filtered + R_minus);
+                            let c_ghost = (0.1 * (r_out_filtered - R_minus)).max(0.5 * c_res);
+                            
+                            let (rho_ghost, p_ghost) = if v_out >= 0.0 {
+                                (w1[0] * (c_ghost / (gamma * w1[2] / w1[0]).sqrt()).powf(5.0),
+                                 w1[2] * (c_ghost / (gamma * w1[2] / w1[0]).sqrt()).powf(7.0))
+                            } else {
+                                (RHO_ATM * (c_ghost / c_res).powf(5.0),
+                                 P_ATM * (c_ghost / c_res).powf(7.0))
+                            };
+                            w0 = [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)];
+                        }
                     }
                 }
+                
+                let state = if use_temp { &mut tubes[k].u_temp } else { &mut tubes[k].u };
+                state[0] = primitive_to_conserved(&w0, gamma);
+                if let Some(r) = new_r_out {
+                    tubes[k].left_last_r_out = r;
+                }
             }
-
-            // Check Right End
-            let connected_right = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube.id && c.side == TubeSide::Right));
+            
+            // 2. Check Right End
+            let connected_right = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == id && c.side == TubeSide::Right));
             if !connected_right {
-                match tube.right_bc {
+                let wm = {
+                    let state = if use_temp { &tubes[k].u_temp } else { &tubes[k].u };
+                    conserved_to_primitive(&state[m], gamma)
+                };
+                
+                let w_m1;
+                let new_r_out;
+                
+                match right_bc {
                     BoundaryType::Closed => {
-                        let wm = conserved_to_primitive(&state[m], gamma);
-                        let w_m1 = [wm[0], -wm[1], wm[2]];
-                        state[m + 1] = primitive_to_conserved(&w_m1, gamma);
+                        w_m1 = [wm[0], -wm[1], wm[2]];
+                        let cm = (gamma * wm[2] / wm[0]).sqrt();
+                        let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
+                        new_r_out = Some(r_wall);
                     }
                     BoundaryType::Open => {
-                        let wm = conserved_to_primitive(&state[m], gamma);
-                        let rho_m1 = if wm[1] < 0.0 { RHO_ATM } else { wm[0] };
-                        let w_m1 = [rho_m1, wm[1], P_ATM];
-                        state[m + 1] = primitive_to_conserved(&w_m1, gamma);
+                        let R_plus = wm[1] + 2.0 * (gamma * wm[2] / wm[0]).sqrt() / (gamma - 1.0);
+                        let R_in = R_plus;
+                        let v_out = Self::solve_bisection_valve(R_in, wm[2], wm[0], (gamma * wm[2] / wm[0]).sqrt(), 1.0, c_res);
+                        let c_bc = 0.2 * (R_in - v_out);
+                        let v_bc = v_out;
+                        
+                        let R_minus_reflected = v_bc - 2.0 * c_bc / (gamma - 1.0);
+                        let alpha = filter_strength;
+                        let last_r_out = tubes[k].right_last_r_out;
+                        let r_out_filtered = alpha * R_minus_reflected + (1.0 - alpha) * last_r_out;
+                        new_r_out = Some(r_out_filtered);
+                        
+                        let v_ghost = 0.5 * (R_plus + r_out_filtered);
+                        let c_ghost = (0.1 * (R_plus - r_out_filtered)).max(0.5 * c_res);
+                        
+                        let (rho_ghost, p_ghost) = if v_out >= 0.0 {
+                            (wm[0] * (c_ghost / (gamma * wm[2] / wm[0]).sqrt()).powf(5.0),
+                             wm[2] * (c_ghost / (gamma * wm[2] / wm[0]).sqrt()).powf(7.0))
+                        } else {
+                            (RHO_ATM * (c_ghost / c_res).powf(5.0),
+                             P_ATM * (c_ghost / c_res).powf(7.0))
+                        };
+                        w_m1 = [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)];
                     }
+                    BoundaryType::Valve { lift } => {
+                        if lift < 1e-4 {
+                            w_m1 = [wm[0], -wm[1], wm[2]];
+                            let cm = (gamma * wm[2] / wm[0]).sqrt();
+                            let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
+                            new_r_out = Some(r_wall);
+                        } else {
+                            let R_plus = wm[1] + 2.0 * (gamma * wm[2] / wm[0]).sqrt() / (gamma - 1.0);
+                            let R_in = R_plus;
+                            let v_out = Self::solve_bisection_valve(R_in, wm[2], wm[0], (gamma * wm[2] / wm[0]).sqrt(), lift, c_res);
+                            let c_bc = 0.2 * (R_in - v_out);
+                            let v_bc = v_out;
+                            
+                            let R_minus_reflected = v_bc - 2.0 * c_bc / (gamma - 1.0);
+                            let alpha = 1.0 - (1.0 - filter_strength) * lift;
+                            let r_out_filtered = alpha * R_minus_reflected + (1.0 - alpha) * tubes[k].right_last_r_out;
+                            new_r_out = Some(r_out_filtered);
+                            
+                            let v_ghost = 0.5 * (R_plus + r_out_filtered);
+                            let c_ghost = (0.1 * (R_plus - r_out_filtered)).max(0.5 * c_res);
+                            
+                            let (rho_ghost, p_ghost) = if v_out >= 0.0 {
+                                (wm[0] * (c_ghost / (gamma * wm[2] / wm[0]).sqrt()).powf(5.0),
+                                 wm[2] * (c_ghost / (gamma * wm[2] / wm[0]).sqrt()).powf(7.0))
+                            } else {
+                                (RHO_ATM * (c_ghost / c_res).powf(5.0),
+                                 P_ATM * (c_ghost / c_res).powf(7.0))
+                            };
+                            w_m1 = [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)];
+                        }
+                    }
+                }
+                
+                let state = if use_temp { &mut tubes[k].u_temp } else { &mut tubes[k].u };
+                state[m + 1] = primitive_to_conserved(&w_m1, gamma);
+                if let Some(r) = new_r_out {
+                    tubes[k].right_last_r_out = r;
                 }
             }
         }
-
+        
         // Apply constant-pressure junction boundary values
         for j in j_states {
             let p_junction = j.e * (gamma - 1.0);
             let rho_junction = j.rho;
             
             for conn in &j.connections {
-                let state = &mut u_states[conn.tube_id];
-                let num_cells = tubes[conn.tube_id].num_cells;
+                let tube = &mut tubes[conn.tube_id];
+                let num_cells = tube.num_cells;
+                let state = if use_temp { &mut tube.u_temp } else { &mut tube.u };
                 
                 match conn.side {
                     TubeSide::Left => {
-                        // Ghost cell 0 is junction
                         let w1 = conserved_to_primitive(&state[1], gamma);
-                        let w0 = [rho_junction, w1[1], p_junction]; // copy P_j, rho_j, extrapolate velocity
+                        let w0 = [rho_junction, w1[1], p_junction];
                         state[0] = primitive_to_conserved(&w0, gamma);
                     }
                     TubeSide::Right => {
-                        // Ghost cell num_cells + 1 is junction
                         let wm = conserved_to_primitive(&state[num_cells], gamma);
                         let w_m1 = [rho_junction, wm[1], p_junction];
                         state[num_cells + 1] = primitive_to_conserved(&w_m1, gamma);
@@ -617,33 +888,94 @@ impl Solver {
         }
     }
 
+    fn solve_bisection_valve(
+        r_in: f32,
+        p_interior: f32,
+        _rho_interior: f32,
+        c_interior: f32,
+        lift: f32,
+        c_res: f32,
+    ) -> f32 {
+        let psi = lift.max(1e-4);
+        let c_int = c_interior.max(1e-2);
+        
+        let eval_residual = |v_out: f32| -> f32 {
+            let c_bc = 0.2 * (r_in - v_out);
+            if c_bc <= 0.0 {
+                return 1e6; // Penalty for non-physical negative sound speeds
+            }
+            
+            let p_bc = p_interior * (c_bc / c_int).powf(7.0);
+            
+            if p_bc >= P_ATM {
+                // Outflow: gas leaves pipe, expands into reservoir
+                let pr = P_ATM / p_bc.max(1e-3);
+                let phi = if pr <= 0.52828 {
+                    0.5787
+                } else {
+                    (5.0 * (pr.powf(1.42857) - pr.powf(1.71429))).max(0.0).sqrt()
+                };
+                let target_v = psi * c_bc * phi;
+                v_out - target_v
+            } else {
+                // Inflow: gas enters pipe from atmospheric reservoir
+                let pr = p_bc / P_ATM;
+                let phi = if pr <= 0.52828 {
+                    0.5787
+                } else {
+                    (5.0 * (pr.powf(1.42857) - pr.powf(1.71429))).max(0.0).sqrt()
+                };
+                let rho_bc = RHO_ATM * (c_bc / c_res).powf(5.0);
+                let g = psi * RHO_ATM * c_res * phi;
+                let target_v = -g / rho_bc.max(1e-3);
+                v_out - target_v
+            }
+        };
+        
+        let mut low = -c_res - 200.0;
+        let mut high = (r_in - 1e-3).max(low + 10.0);
+        
+        for _ in 0..25 {
+            let mid = 0.5 * (low + high);
+            let res = eval_residual(mid);
+            if res > 0.0 {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        
+        0.5 * (low + high)
+    }
+
 
 
     /// Internal FVM scheme solver
     fn compute_rhs_internal(
         limiter: LimiterType,
         friction: f32,
-        tube: &Tube,
-        state: &Vec<[f32; 3]>,
-    ) -> (Vec<[f32; 3]>, [f32; 3], [f32; 3]) {
+        heat_transfer: f32,
+        tube: &mut Tube,
+        use_temp: bool,
+    ) -> ([f32; 3], [f32; 3]) {
         let num_cells = tube.num_cells;
         let dx = tube.dx;
         let gamma = 1.4;
 
+        let state = if use_temp { &tube.u_temp } else { &tube.u };
+
         // 1. Primitive variables
-        let mut w = vec![[0.0; 3]; num_cells + 2];
         for i in 0..=(num_cells + 1) {
-            w[i] = conserved_to_primitive(&state[i], gamma);
+            tube.w[i] = conserved_to_primitive(&state[i], gamma);
         }
 
         // 2. MUSCL slopes
-        let mut slopes = vec![[0.0; 3]; num_cells + 2];
         for i in 1..=num_cells {
-            let dw_l = [w[i][0] - w[i - 1][0], w[i][1] - w[i - 1][1], w[i][2] - w[i - 1][2]];
-            let dw_r = [w[i + 1][0] - w[i][0], w[i + 1][1] - w[i][1], w[i + 1][2] - w[i][2]];
+            let dw_l = [tube.w[i][0] - tube.w[i - 1][0], tube.w[i][1] - tube.w[i - 1][1], tube.w[i][2] - tube.w[i - 1][2]];
+            let dw_r = [tube.w[i + 1][0] - tube.w[i][0], tube.w[i + 1][1] - tube.w[i][1], tube.w[i + 1][2] - tube.w[i][2]];
 
             for k in 0..3 {
-                slopes[i][k] = match limiter {
+                tube.slopes[i][k] = match limiter {
                     LimiterType::None => 0.0,
                     LimiterType::Minmod => limit_slope_minmod(dw_l[k], dw_r[k]),
                     LimiterType::Superbee => limit_slope_superbee(dw_l[k], dw_r[k]),
@@ -654,21 +986,20 @@ impl Solver {
         }
 
         // 3. Interface Fluxes
-        let mut fluxes = vec![[0.0; 3]; num_cells + 1];
         for j in 0..=num_cells {
-            let mut w_l = w[j];
+            let mut w_l = tube.w[j];
             if j >= 1 {
                 for k in 0..3 {
-                    w_l[k] += 0.5 * slopes[j][k];
+                    w_l[k] += 0.5 * tube.slopes[j][k];
                 }
             }
             w_l[0] = w_l[0].max(1e-4);
             w_l[2] = w_l[2].max(1e-2);
 
-            let mut w_r = w[j + 1];
+            let mut w_r = tube.w[j + 1];
             if j + 1 <= num_cells {
                 for k in 0..3 {
-                    w_r[k] -= 0.5 * slopes[j + 1][k];
+                    w_r[k] -= 0.5 * tube.slopes[j + 1][k];
                 }
             }
             w_r[0] = w_r[0].max(1e-4);
@@ -688,21 +1019,20 @@ impl Solver {
             for k in 0..3 {
                 interface_flux[k] = 0.5 * (flux_l[k] + flux_r[k]) - 0.5 * max_wave_speed * (u_r[k] - u_l[k]);
             }
-            fluxes[j] = interface_flux;
+            tube.fluxes[j] = interface_flux;
         }
 
         // Save boundary interface fluxes
-        let left_flux = fluxes[0];
-        let right_flux = fluxes[num_cells];
+        let left_flux = tube.fluxes[0];
+        let right_flux = tube.fluxes[num_cells];
 
         // 4. Update cells with source terms (including variable area)
-        let mut rhs = vec![[0.0; 3]; num_cells + 2];
         let idx = 1.0 / dx;
 
         for i in 1..=num_cells {
-            rhs[i][0] = -idx * (fluxes[i][0] - fluxes[i - 1][0]);
-            rhs[i][1] = -idx * (fluxes[i][1] - fluxes[i - 1][1]);
-            rhs[i][2] = -idx * (fluxes[i][2] - fluxes[i - 1][2]);
+            tube.rhs[i][0] = -idx * (tube.fluxes[i][0] - tube.fluxes[i - 1][0]);
+            tube.rhs[i][1] = -idx * (tube.fluxes[i][1] - tube.fluxes[i - 1][1]);
+            tube.rhs[i][2] = -idx * (tube.fluxes[i][2] - tube.fluxes[i - 1][2]);
 
             // Variable cross-sectional area source term:
             // S_A = - dA/dx * 1/A * [rho*v, rho*v^2, (E + P)*v]
@@ -712,16 +1042,16 @@ impl Solver {
             if a > 1e-6 && dadx.abs() > 1e-6 {
                 let rho = state[i][0];
                 let v = state[i][1] / rho.max(1e-5);
-                let p = w[i][2];
+                let p = tube.w[i][2];
                 let e = state[i][2];
 
                 let s_area_mass = -(dadx / a) * rho * v;
                 let s_area_momentum = -(dadx / a) * rho * v * v;
                 let s_area_energy = -(dadx / a) * (e + p) * v;
 
-                rhs[i][0] += s_area_mass;
-                rhs[i][1] += s_area_momentum;
-                rhs[i][2] += s_area_energy;
+                tube.rhs[i][0] += s_area_mass;
+                tube.rhs[i][1] += s_area_momentum;
+                tube.rhs[i][2] += s_area_energy;
             }
 
             // Friction source term
@@ -732,12 +1062,31 @@ impl Solver {
                 let s_momentum = -friction * rho * v;
                 let s_energy = -friction * rho * v * v;
                 
-                rhs[i][1] += s_momentum;
-                rhs[i][2] += s_energy;
+                tube.rhs[i][1] += s_momentum;
+                tube.rhs[i][2] += s_energy;
+            }
+
+            // Wall heat transfer: relaxes gas temperature toward wall temperature (T_ATM)
+            // This provides the missing energy sink — after a pulse passes, elevated
+            // pressure/temperature gradually returns to atmospheric equilibrium.
+            if heat_transfer > 0.0 {
+                let rho = state[i][0].max(1e-5);
+                let v = state[i][1] / rho;
+                let ke = 0.5 * rho * v * v;
+                let internal_e = (state[i][2] - ke).max(1e-4);
+                let p = internal_e * (gamma - 1.0);
+                let t_gas = p / (rho * R_AIR);
+                let dt_wall = t_gas - T_ATM;
+
+                // Energy loss rate scaled by surface-to-volume ratio (2/radius for circular tube)
+                let radius = (tube.area[i] / std::f32::consts::PI).sqrt().max(0.001);
+                let s_energy_heat = -heat_transfer * rho * R_AIR * dt_wall * (2.0 / radius);
+
+                tube.rhs[i][2] += s_energy_heat;
             }
         }
 
-        (rhs, left_flux, right_flux)
+        (left_flux, right_flux)
     }
 }
 
@@ -907,6 +1256,42 @@ mod tests {
                 assert!(!cell[0].is_nan());
                 assert!(!cell[1].is_nan());
                 assert!(!cell[2].is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn test_boundary_stability() {
+        // Create a solver with a single tube, open at both ends to test inflow stability
+        let mut solver = Solver::new_single_tube(RadiusProfile::Linear, BoundaryType::Open, BoundaryType::Open);
+        
+        // Set a high reflection filter and low friction to make stability harder
+        solver.reflection_filter = 0.85;
+        solver.friction = 5.0;
+        
+        // Inject multiple strong pulses
+        for _ in 0..5 {
+            solver.inject_pulse(150000.0, 0.05);
+            
+            // Step the solver for some time
+            let sim_dt = 1.0 / 64000.0;
+            for _ in 0..100 {
+                let jones_val = solver.step(sim_dt);
+                assert!(!jones_val.is_nan());
+                assert!(jones_val.abs() < 1e7, "Jones signal blew up: {}", jones_val);
+            }
+        }
+        
+        // Verify all cell states are physically reasonable and non-NaN
+        for tube in &solver.tubes {
+            for cell in &tube.u {
+                assert!(!cell[0].is_nan());
+                assert!(!cell[1].is_nan());
+                assert!(!cell[2].is_nan());
+                
+                let w = conserved_to_primitive(cell, 1.4);
+                assert!(w[0] > 1e-3, "Density went below physical threshold: {}", w[0]);
+                assert!(w[2] > 1e-1, "Pressure went below physical threshold: {}", w[2]);
             }
         }
     }

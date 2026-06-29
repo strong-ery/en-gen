@@ -7,6 +7,7 @@ use engen_core::cfd::solver::{
     Solver, Tube, Junction, RadiusProfile, LimiterType, BoundaryType, TubeSide,
     P_ATM, RHO_ATM, bezier_point, bezier_length
 };
+use engen_audio::AudioFilterParams;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -55,6 +56,7 @@ struct SharedState {
     
     limiter: LimiterType,
     friction: f32,
+    heat_transfer: f32,
     speed_multiplier: f32,
     
     inject_pulse: bool,
@@ -66,9 +68,21 @@ struct SharedState {
     
     steps_per_second: f32,
     real_time_factor: f32,
+    
+    audio_volume: f32,
+    reflection_filter: f32,
+    jones_history: Vec<f32>,
+    
+    // Audio filter cutoffs (Hz) - synced to AudioFilterParams
+    lp_cutoff_hz: f32,
+    hp_cutoff_hz: f32,
 }
 
-fn spawn_solver_thread(shared_state: Arc<Mutex<SharedState>>) -> std::thread::JoinHandle<()> {
+fn spawn_solver_thread(
+    shared_state: Arc<Mutex<SharedState>>,
+    audio_buffer: Arc<Mutex<Vec<f32>>>,
+    _filter_params: Arc<Mutex<AudioFilterParams>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut solver = Solver::new_y_junction(); // default Y-junction preset
 
@@ -80,13 +94,14 @@ fn spawn_solver_thread(shared_state: Arc<Mutex<SharedState>>) -> std::thread::Jo
             state.time = solver.t;
         }
         
-        let mut last_real_time = std::time::Instant::now();
-        let mut step_accumulator = 0.0;
         let mut steps_this_second = 0;
         let mut steps_timer = std::time::Instant::now();
         let mut last_ui_update = std::time::Instant::now();
         
         let sim_dt = 1.0 / 64000.0; // 64kHz
+        
+        let mut local_jones_history = Vec::new();
+        let mut local_audio_buf: Vec<f32> = Vec::with_capacity(128);
         
         loop {
             let mut inject = false;
@@ -96,6 +111,8 @@ fn spawn_solver_thread(shared_state: Arc<Mutex<SharedState>>) -> std::thread::Jo
             let speed;
             let mut preset_to_load = None;
             let mut force_ui_update = false;
+            let audio_volume;
+            let reflection_filter;
             
             {
                 if let Ok(mut state) = shared_state.lock() {
@@ -114,9 +131,30 @@ fn spawn_solver_thread(shared_state: Arc<Mutex<SharedState>>) -> std::thread::Jo
                     }
                     speed = state.speed_multiplier;
                     
+                    audio_volume = state.audio_volume;
+                    reflection_filter = state.reflection_filter;
+                    
                     // Sync runtime editable fields
                     solver.limiter = state.limiter;
                     solver.friction = state.friction;
+                    solver.heat_transfer = state.heat_transfer;
+                    solver.reflection_filter = reflection_filter;
+                    
+                    // Sync valve lifts dynamically without resetting
+                    for (k, tube) in solver.tubes.iter_mut().enumerate() {
+                        if k < state.tubes.len() {
+                            if let BoundaryType::Valve { lift } = state.tubes[k].left_bc {
+                                if let BoundaryType::Valve { lift: ref mut l_lift } = tube.left_bc {
+                                    *l_lift = lift;
+                                }
+                            }
+                            if let BoundaryType::Valve { lift } = state.tubes[k].right_bc {
+                                if let BoundaryType::Valve { lift: ref mut r_lift } = tube.right_bc {
+                                    *r_lift = lift;
+                                }
+                            }
+                        }
+                    }
                 } else {
                     break; // exit thread
                 }
@@ -192,24 +230,44 @@ fn spawn_solver_thread(shared_state: Arc<Mutex<SharedState>>) -> std::thread::Jo
                 force_ui_update = true;
             }
             
-            let now = std::time::Instant::now();
-            let elapsed_sec = now.duration_since(last_real_time).as_secs_f32();
-            last_real_time = now;
-            
-            if speed > 0.0 {
-                let target_sim_adv = elapsed_sec * speed;
-                step_accumulator += target_sim_adv;
-                
-                if step_accumulator > 0.1 {
-                    step_accumulator = 0.1;
+            let current_len = {
+                if let Ok(buf) = audio_buffer.lock() {
+                    buf.len()
+                } else {
+                    0
                 }
+            };
+            
+            let target_len = 3000;
+            if current_len < target_len && speed > 0.0 {
+                let missing_samples = target_len - current_len;
+                let steps_to_run = ((missing_samples as f32) / speed) as usize;
+                let steps_to_run = steps_to_run.min(500).max(1);
                 
+                local_audio_buf.clear();
                 let mut steps_run = 0;
-                while step_accumulator >= sim_dt {
-                    solver.step(sim_dt);
-                    step_accumulator -= sim_dt;
+                
+                for _ in 0..steps_to_run {
+                    let jones_val = solver.step(sim_dt);
+                    
+                    let scaled_jones = jones_val * 5.0e-2;
+                    let scaled = scaled_jones * audio_volume;
+                    let audio_sample = scaled / (1.0 + scaled.abs());
+                    local_audio_buf.push(audio_sample);
+                    
+                    local_jones_history.push(scaled_jones);
+                    if local_jones_history.len() > 4096 {
+                        let excess = local_jones_history.len() - 4096;
+                        local_jones_history.drain(0..excess);
+                    }
                     steps_run += 1;
                     steps_this_second += 1;
+                }
+                
+                if !local_audio_buf.is_empty() {
+                    if let Ok(mut audio_buf) = audio_buffer.lock() {
+                        audio_buf.extend_from_slice(&local_audio_buf);
+                    }
                 }
                 
                 let now_ui = std::time::Instant::now();
@@ -218,19 +276,21 @@ fn spawn_solver_thread(shared_state: Arc<Mutex<SharedState>>) -> std::thread::Jo
                         state.tubes = solver.tubes.clone();
                         state.junctions = solver.junctions.clone();
                         state.time = solver.t;
+                        state.jones_history = local_jones_history.clone();
                     }
                     last_ui_update = now_ui;
                 }
             } else {
-                step_accumulator = 0.0;
                 if force_ui_update {
                     if let Ok(mut state) = shared_state.lock() {
                         state.tubes = solver.tubes.clone();
                         state.junctions = solver.junctions.clone();
                         state.time = solver.t;
+                        state.jones_history = local_jones_history.clone();
                     }
                     last_ui_update = std::time::Instant::now();
                 }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             
             if steps_timer.elapsed().as_secs_f32() >= 1.0 {
@@ -249,11 +309,13 @@ fn spawn_solver_thread(shared_state: Arc<Mutex<SharedState>>) -> std::thread::Jo
 
 struct EngenApp {
     shared_state: Arc<Mutex<SharedState>>,
+    filter_params: Arc<Mutex<AudioFilterParams>>,
     active_tab: Tab,
     amplitude_input: f32,
     width_input: f32,
     speed_input: f32,
     friction_input: f32,
+    heat_transfer_input: f32,
     limiter_input: LimiterType,
     fixed_scale: bool,
     
@@ -262,28 +324,41 @@ struct EngenApp {
     
     dragging_handle: Option<DragHandle>,
     flow_particles: Vec<Particle>,
+    
+    volume_input: f32,
+    reflection_input: f32,
+    
+    lp_cutoff_input: f32,
+    hp_cutoff_input: f32,
 }
 
 impl EngenApp {
-    fn new(shared_state: Arc<Mutex<SharedState>>) -> Self {
-        let (limiter, friction) = {
+    fn new(shared_state: Arc<Mutex<SharedState>>, filter_params: Arc<Mutex<AudioFilterParams>>) -> Self {
+        let (limiter, friction, heat_transfer, vol, filter, lp_cutoff, hp_cutoff) = {
             let state = shared_state.lock().unwrap();
-            (state.limiter, state.friction)
+            (state.limiter, state.friction, state.heat_transfer, state.audio_volume, state.reflection_filter,
+             state.lp_cutoff_hz, state.hp_cutoff_hz)
         };
         
         let mut app = Self {
             shared_state,
+            filter_params,
             active_tab: Tab::Pressure,
             amplitude_input: 20000.0,
             width_input: 0.08,
             speed_input: 1.0,
             friction_input: friction,
+            heat_transfer_input: heat_transfer,
             limiter_input: limiter,
             fixed_scale: true,
             preset_selection: PresetType::YJunction,
             selected_tube_id: Some(0),
             dragging_handle: None,
             flow_particles: Vec::new(),
+            volume_input: vol,
+            reflection_input: filter,
+            lp_cutoff_input: lp_cutoff,
+            hp_cutoff_input: hp_cutoff,
         };
         app.reseed_particles();
         app
@@ -294,10 +369,10 @@ impl EngenApp {
         let state = self.shared_state.lock().unwrap();
         for tube in &state.tubes {
             // Spawn 15 particles evenly spaced per tube
-            for i in 0..15 {
+            for _ in 0..15 {
                 self.flow_particles.push(Particle {
                     tube_id: tube.id,
-                    t: i as f32 / 15.0,
+                    t: 0.0,
                 });
             }
         }
@@ -314,7 +389,10 @@ impl eframe::App for EngenApp {
             // Sync control inputs to shared state config
             state.limiter = self.limiter_input;
             state.friction = self.friction_input;
+            state.heat_transfer = self.heat_transfer_input;
             state.speed_multiplier = self.speed_input;
+            state.audio_volume = self.volume_input;
+            state.reflection_filter = self.reflection_input;
             
             (
                 state.tubes.clone(),
@@ -433,6 +511,35 @@ impl eframe::App for EngenApp {
                 });
                 
                 ui.add(egui::Slider::new(&mut self.friction_input, 0.0..=50.0).text("Wall Friction"));
+                ui.add(egui::Slider::new(&mut self.heat_transfer_input, 0.0..=200.0).text("Wall Heat Transfer"));
+                ui.add(egui::Slider::new(&mut self.volume_input, 0.0..=1.0).text("Audio Volume"));
+                ui.add(egui::Slider::new(&mut self.reflection_input, 0.5..=1.0).text("Reflection Filter"));
+            });
+            
+            ui.add_space(10.0);
+            
+            // Audio Filter Controls
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Audio Filters").strong());
+                ui.label(egui::RichText::new("Adjust to trim crackling / rumble").weak().size(11.0));
+                if ui.add(egui::Slider::new(&mut self.lp_cutoff_input, 500.0..=20000.0)
+                    .text("LP Cutoff")
+                    .suffix(" Hz")
+                    .logarithmic(true)
+                ).changed() {
+                    if let Ok(mut fp) = self.filter_params.lock() {
+                        fp.lp_cutoff_hz = self.lp_cutoff_input;
+                    }
+                }
+                if ui.add(egui::Slider::new(&mut self.hp_cutoff_input, 1.0..=5000.0)
+                    .text("HP Cutoff")
+                    .suffix(" Hz")
+                    .logarithmic(true)
+                ).changed() {
+                    if let Ok(mut fp) = self.filter_params.lock() {
+                        fp.hp_cutoff_hz = self.hp_cutoff_input;
+                    }
+                }
             });
 
             // Geometry editor panel for selected tube
@@ -478,11 +585,39 @@ impl eframe::App for EngenApp {
                         if !connected_left {
                             ui.horizontal(|ui| {
                                 ui.label("Left BC:");
-                                if ui.radio_value(&mut temp_tube.left_bc, BoundaryType::Closed, "Closed").clicked()
-                                   || ui.radio_value(&mut temp_tube.left_bc, BoundaryType::Open, "Open").clicked() {
+                                let mut left_type = match temp_tube.left_bc {
+                                    BoundaryType::Closed => 0,
+                                    BoundaryType::Open => 1,
+                                    BoundaryType::Valve { .. } => 2,
+                                };
+                                let old_type = left_type;
+                                egui::ComboBox::from_id_source("left_bc_combo")
+                                    .selected_text(match left_type {
+                                        0 => "Closed",
+                                        1 => "Open",
+                                        _ => "Valve",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut left_type, 0, "Closed");
+                                        ui.selectable_value(&mut left_type, 1, "Open");
+                                        ui.selectable_value(&mut left_type, 2, "Valve");
+                                    });
+                                if left_type != old_type {
+                                    temp_tube.left_bc = match left_type {
+                                        0 => BoundaryType::Closed,
+                                        1 => BoundaryType::Open,
+                                        _ => BoundaryType::Valve { lift: 1.0 },
+                                    };
                                     geom_changed = true;
                                 }
                             });
+                            if let BoundaryType::Valve { mut lift } = temp_tube.left_bc {
+                                if ui.add(egui::Slider::new(&mut lift, 0.0..=1.0).text("Left Valve Lift")).changed() {
+                                    temp_tube.left_bc = BoundaryType::Valve { lift };
+                                    let mut state = self.shared_state.lock().unwrap();
+                                    state.tubes[tube_id].left_bc = BoundaryType::Valve { lift };
+                                }
+                            }
                         } else {
                             ui.label(egui::RichText::new("Left end connects to Junction").weak().size(11.0));
                         }
@@ -490,11 +625,39 @@ impl eframe::App for EngenApp {
                         if !connected_right {
                             ui.horizontal(|ui| {
                                 ui.label("Right BC:");
-                                if ui.radio_value(&mut temp_tube.right_bc, BoundaryType::Closed, "Closed").clicked()
-                                   || ui.radio_value(&mut temp_tube.right_bc, BoundaryType::Open, "Open").clicked() {
+                                let mut right_type = match temp_tube.right_bc {
+                                    BoundaryType::Closed => 0,
+                                    BoundaryType::Open => 1,
+                                    BoundaryType::Valve { .. } => 2,
+                                };
+                                let old_type = right_type;
+                                egui::ComboBox::from_id_source("right_bc_combo")
+                                    .selected_text(match right_type {
+                                        0 => "Closed",
+                                        1 => "Open",
+                                        _ => "Valve",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut right_type, 0, "Closed");
+                                        ui.selectable_value(&mut right_type, 1, "Open");
+                                        ui.selectable_value(&mut right_type, 2, "Valve");
+                                    });
+                                if right_type != old_type {
+                                    temp_tube.right_bc = match right_type {
+                                        0 => BoundaryType::Closed,
+                                        1 => BoundaryType::Open,
+                                        _ => BoundaryType::Valve { lift: 1.0 },
+                                    };
                                     geom_changed = true;
                                 }
                             });
+                            if let BoundaryType::Valve { mut lift } = temp_tube.right_bc {
+                                if ui.add(egui::Slider::new(&mut lift, 0.0..=1.0).text("Right Valve Lift")).changed() {
+                                    temp_tube.right_bc = BoundaryType::Valve { lift };
+                                    let mut state = self.shared_state.lock().unwrap();
+                                    state.tubes[tube_id].right_bc = BoundaryType::Valve { lift };
+                                }
+                            }
                         } else {
                             ui.label(egui::RichText::new("Right end connects to Junction").weak().size(11.0));
                         }
@@ -636,13 +799,15 @@ impl eframe::App for EngenApp {
                     painter.circle_stroke(screen_pos, 12.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 215, 0)));
                 }
 
-                // 3. Update & Draw Flow Particles
+                // 3. Update & Draw Flow Particles (Fixed-Slot Local Phase-Flow)
                 let dt = ctx.input(|i| i.stable_dt).min(0.05); // Limit delta time spike
                 if self.speed_input > 0.0 {
-                    for particle in &mut self.flow_particles {
+                    for (idx, particle) in self.flow_particles.iter_mut().enumerate() {
                         if let Some(tube) = tubes.iter().find(|t| t.id == particle.tube_id) {
                             let m = tube.num_cells;
-                            let cell_idx = (particle.t * m as f32).floor() as usize;
+                            let slot_idx = idx % 15;
+                            let t_pos = (slot_idx as f32 + particle.t) / 15.0;
+                            let cell_idx = (t_pos * m as f32).floor() as usize;
                             let cell_idx = cell_idx.clamp(1, m);
                             
                             // Get local velocity in cell
@@ -650,16 +815,18 @@ impl eframe::App for EngenApp {
                             let velocity = u_cell[1] / u_cell[0].max(1e-5);
                             let length = bezier_length(tube.p0, tube.p1, tube.p2, tube.p3).max(0.1);
 
-                            // Update particle progress: dt * velocity / length
-                            let delta_t = (velocity * dt * self.speed_input) / length;
-                            particle.t = (particle.t + delta_t).rem_euclid(1.0);
+                            // Update particle phase offset (15 slots)
+                            let delta_phase = 15.0 * (velocity * dt * self.speed_input) / length;
+                            particle.t = (particle.t + delta_phase).rem_euclid(1.0);
                         }
                     }
                 }
 
-                for particle in &self.flow_particles {
+                for (idx, particle) in self.flow_particles.iter().enumerate() {
                     if let Some(tube) = tubes.iter().find(|t| t.id == particle.tube_id) {
-                        let p = bezier_point(particle.t, tube.p0, tube.p1, tube.p2, tube.p3);
+                        let slot_idx = idx % 15;
+                        let t_draw = (slot_idx as f32 + particle.t) / 15.0;
+                        let p = bezier_point(t_draw, tube.p0, tube.p1, tube.p2, tube.p3);
                         let s_pos = to_screen(p);
                         painter.circle_filled(s_pos, 2.0, egui::Color32::from_rgb(255, 255, 224));
                     }
@@ -912,6 +1079,33 @@ impl eframe::App for EngenApp {
                     ui.label("Click on any tube in the layout viewport to plot its values.");
                 });
             }
+            
+            ui.add_space(5.0);
+            ui.separator();
+            ui.add_space(5.0);
+            ui.label(egui::RichText::new("Jones Audio Outlet Radiation Signal (dP/dt)").strong());
+            
+            let jones_history = {
+                let state = self.shared_state.lock().unwrap();
+                state.jones_history.clone()
+            };
+            
+            let points: PlotPoints = jones_history
+                .iter()
+                .enumerate()
+                .map(|(i, &val)| [i as f64, val as f64])
+                .collect();
+            
+            let line = Line::new(points).color(egui::Color32::from_rgb(255, 105, 180)).width(1.5);
+            let plot = Plot::new("jones_plot")
+                .height(100.0)
+                .show_grid(true)
+                .include_y(-1000.0)
+                .include_y(1000.0);
+            plot.show(ui, |plot_ui| {
+                plot_ui.hline(HLine::new(0.0).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
+                plot_ui.line(line);
+            });
         });
     }
 }
@@ -919,17 +1113,29 @@ impl eframe::App for EngenApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("EnGen - 1D Compressible Network CFD Solver (Milestone 2)")
-            .with_inner_size([1200.0, 750.0]),
+            .with_title("EnGen - 1D Compressible Network CFD Solver (Milestone 3)")
+            .with_inner_size([1200.0, 850.0]),
         ..Default::default()
     };
     
+    let audio_buffer = Arc::new(Mutex::new(Vec::new()));
+    let filter_params = Arc::new(Mutex::new(AudioFilterParams::default()));
+    let _audio_system = match engen_audio::AudioSystem::new(Arc::clone(&audio_buffer), Arc::clone(&filter_params)) {
+        Ok(sys) => Some(sys),
+        Err(e) => {
+            eprintln!("Failed to initialize audio: {}", e);
+            None
+        }
+    };
+    
+    let default_fp = AudioFilterParams::default();
     let shared_state = Arc::new(Mutex::new(SharedState {
         tubes: Vec::new(),
         junctions: Vec::new(),
         time: 0.0,
-        limiter: LimiterType::MC,
-        friction: 0.0,
+        limiter: LimiterType::VanLeer,
+        friction: 15.0,
+        heat_transfer: 50.0,
         speed_multiplier: 1.0,
         inject_pulse: false,
         pulse_amplitude: 20000.0,
@@ -938,9 +1144,14 @@ fn main() -> eframe::Result<()> {
         reset_trigger: false,
         steps_per_second: 0.0,
         real_time_factor: 0.0,
+        audio_volume: 0.8,
+        reflection_filter: 0.75,
+        jones_history: Vec::new(),
+        lp_cutoff_hz: default_fp.lp_cutoff_hz,
+        hp_cutoff_hz: default_fp.hp_cutoff_hz,
     }));
     
-    let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state));
+    let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state), Arc::clone(&audio_buffer), Arc::clone(&filter_params));
     
     eframe::run_native(
         "engen_ui",
@@ -950,7 +1161,7 @@ fn main() -> eframe::Result<()> {
             style.visuals.dark_mode = true;
             cc.egui_ctx.set_style(style);
             
-            Ok(Box::new(EngenApp::new(shared_state)))
+            Ok(Box::new(EngenApp::new(shared_state, filter_params)))
         }),
     )
 }
