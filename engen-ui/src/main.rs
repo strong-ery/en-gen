@@ -1,11 +1,11 @@
 // TEMP: disabled for debugging - re-enable once throttle/RPM issue is diagnosed
-// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
 use egui_plot::{Plot, Line, HLine, PlotPoints};
 use std::sync::{Arc, Mutex};
 use engen_core::cfd::solver::{
-    Solver, Tube, Junction, RadiusProfile, LimiterType, BoundaryType, TubeSide,
+    Solver, Tube, Junction, RadiusProfile, LimiterType, BoundaryType, TubeSide, SolverProfile,
     P_ATM, RHO_ATM, bezier_point, bezier_length
 };
 use engen_core::mechanical::get_valve_lift;
@@ -25,6 +25,7 @@ enum PresetType {
     ExpansionChamber,
     YJunction,
     SingleCylinder,
+    InlineFour,
 }
 
 impl std::fmt::Display for PresetType {
@@ -35,6 +36,7 @@ impl std::fmt::Display for PresetType {
             PresetType::ExpansionChamber => write!(f, "Expansion Chamber"),
             PresetType::YJunction => write!(f, "Y-Junction Exhaust"),
             PresetType::SingleCylinder => write!(f, "Single Cylinder Engine"),
+            PresetType::InlineFour => write!(f, "Inline-4 Engine"),
         }
     }
 }
@@ -88,8 +90,8 @@ struct SharedState {
     pub cylinder_pressure: f32,
     pub cylinder_volume: f32,
     
-    // Cyl pressure history for the PV/crank angle plot
-    pub cyl_pressure_history: Vec<[f32; 2]>, // [crank_angle_degrees, pressure_pa]
+    // Cyl pressure histories for all cylinders
+    pub cyl_pressure_histories: Vec<Vec<[f32; 2]>>, // Index = Cylinder ID, elements = [crank_angle_degrees, pressure_pa]
     
     // Engine parameters (editable)
     pub engine_bore: f32,
@@ -124,6 +126,7 @@ struct SharedState {
     pub residual_fraction: f32,
     pub last_misfire: bool,
     pub misfire_count: u32,
+    pub profile: SolverProfile,
 }
 
 fn spawn_solver_thread(
@@ -228,7 +231,7 @@ fn spawn_solver_thread(
                                 state.engine_conrod,
                                 state.engine_compression_ratio,
                             );
-                            state.cyl_pressure_history.clear();
+                            state.cyl_pressure_histories.clear();
                         }
                     }
 
@@ -273,6 +276,7 @@ fn spawn_solver_thread(
                     PresetType::ExpansionChamber => Solver::new_single_tube(RadiusProfile::ExpansionChamber, BoundaryType::Closed, BoundaryType::Closed),
                     PresetType::YJunction => Solver::new_y_junction(),
                     PresetType::SingleCylinder => Solver::new_single_cylinder(),
+                    PresetType::InlineFour => Solver::new_inline_four(),
                 };
                 if let Ok(mut state) = shared_state.lock() {
                     state.tubes = solver.tubes.clone();
@@ -303,6 +307,7 @@ fn spawn_solver_thread(
                     state.residual_fraction = solver.last_residual_fraction;
                     state.last_misfire = solver.last_misfire;
                     state.misfire_count = solver.misfire_count;
+                    state.profile = solver.profile;
                     
                     // Sync starter disengagement
                     if !solver.starter_active && state.starter_engaged {
@@ -310,7 +315,7 @@ fn spawn_solver_thread(
                         state.starter_timer = 0.0;
                     }
                     
-                    state.cyl_pressure_history.clear();
+                    state.cyl_pressure_histories.clear();
                 }
                 force_ui_update = true;
             }
@@ -353,6 +358,7 @@ fn spawn_solver_thread(
                             j.volume = vol * 0.5;
                         }
                     }
+                    solver.update_connected_flags();
                     solver.t = 0.0;
                 }
                 force_ui_update = true;
@@ -432,6 +438,7 @@ fn spawn_solver_thread(
                         state.residual_fraction = solver.last_residual_fraction;
                         state.last_misfire = solver.last_misfire;
                         state.misfire_count = solver.misfire_count;
+                        state.profile = solver.profile;
 
                         // Sync starter disengagement
                         if !solver.starter_active && state.starter_engaged {
@@ -446,13 +453,20 @@ fn spawn_solver_thread(
                             if let Some(cyl) = solver.cylinders.first() {
                                 state.cylinder_pressure = cyl.p;
                                 state.cylinder_volume = cyl.volume;
-                                
-                                let angle_deg = crank.theta.to_degrees();
-                                state.cyl_pressure_history.push([angle_deg, cyl.p]);
-                                if state.cyl_pressure_history.len() > 360 {
-                                    state.cyl_pressure_history.remove(0);
+                            }
+                            
+                            if state.cyl_pressure_histories.len() < solver.cylinders.len() {
+                                state.cyl_pressure_histories.resize(solver.cylinders.len(), Vec::new());
+                            }
+                            for (i, c_cyl) in solver.cylinders.iter().enumerate() {
+                                let angle_deg = (crank.theta + c_cyl.crank_pin_offset_radians).to_degrees().rem_euclid(720.0);
+                                state.cyl_pressure_histories[i].push([angle_deg, c_cyl.p]);
+                                if state.cyl_pressure_histories[i].len() > 360 {
+                                    state.cyl_pressure_histories[i].remove(0);
                                 }
+                            }
 
+                            if let Some(cyl) = solver.cylinders.first() {
                                 // TEMP DEBUG: print throttle/lift/rpm/cyl mass once per second
                                 // to verify the throttle value is actually reaching tube 0 and
                                 // actually changing trapped cylinder mass. Remove once diagnosed.
@@ -471,7 +485,7 @@ fn spawn_solver_thread(
                             }
                         } else {
                             state.has_engine = false;
-                            state.cyl_pressure_history.clear();
+                            state.cyl_pressure_histories.clear();
                         }
                     }
                     last_ui_update = now_ui;
@@ -551,6 +565,7 @@ struct EngenApp {
     ignition_timing_deg_input: f32,
     target_afr_input: f32,
     audio_on_input: bool,
+    header_length_input: f32,
 }
 
 impl EngenApp {
@@ -597,6 +612,7 @@ impl EngenApp {
             ignition_timing_deg_input: timing,
             target_afr_input: afr,
             audio_on_input: audio,
+            header_length_input: 0.4,
         };
         app.reseed_particles();
         app
@@ -627,7 +643,7 @@ impl eframe::App for EngenApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
         }
 
-        let (tubes, junctions, current_time, rtf, sps, has_engine, engine_rpm, crank_angle, cyl_p, cyl_v, eng_bore, eng_stroke, eng_conrod) = {
+        let (tubes, junctions, current_time, rtf, sps, has_engine, engine_rpm, crank_angle, cyl_p, cyl_v, eng_bore, eng_stroke, eng_conrod, solver_profile) = {
             let mut state = self.shared_state.lock().unwrap();
             
             // Sync control inputs to shared state config
@@ -672,6 +688,7 @@ impl eframe::App for EngenApp {
                 state.engine_bore,
                 state.engine_stroke,
                 state.engine_conrod,
+                state.profile,
             )
         };
         
@@ -699,6 +716,7 @@ impl eframe::App for EngenApp {
                             ui.selectable_value(&mut self.preset_selection, PresetType::ExpansionChamber, "Expansion Chamber");
                             ui.selectable_value(&mut self.preset_selection, PresetType::YJunction, "Y-Junction Exhaust");
                             ui.selectable_value(&mut self.preset_selection, PresetType::SingleCylinder, "Single Cylinder Engine");
+                            ui.selectable_value(&mut self.preset_selection, PresetType::InlineFour, "Inline-4 Engine");
                         });
                     
                     if self.preset_selection != old_preset {
@@ -707,6 +725,44 @@ impl eframe::App for EngenApp {
                         self.selected_tube_id = Some(0);
                         // Defer reseed particles until next frame once solver recreates tubes
                         ctx.request_repaint();
+                    }
+
+                    if self.preset_selection == PresetType::InlineFour {
+                        ui.add_space(5.0);
+                        if ui.add(egui::Slider::new(&mut self.header_length_input, 0.15..=1.0).text("Header Length").suffix(" m")).changed() {
+                            if let Ok(mut state) = self.shared_state.lock() {
+                                let l = self.header_length_input;
+                                let collector_x = -0.2 + l;
+                                
+                                // Re-scale header tubes 5, 6, 7, 8
+                                let y_ports = [0.6, 0.2, -0.2, -0.6];
+                                for idx in 0..4 {
+                                    let tube_idx = 5 + idx;
+                                    let y_port = y_ports[idx];
+                                    if tube_idx < state.tubes.len() {
+                                        state.tubes[tube_idx].p0 = [-0.2, y_port];
+                                        state.tubes[tube_idx].p1 = [-0.2 + 0.3 * l, y_port];
+                                        state.tubes[tube_idx].p2 = [collector_x - 0.3 * l, 0.0];
+                                        state.tubes[tube_idx].p3 = [collector_x, 0.0];
+                                    }
+                                }
+                                
+                                // Re-scale tailpipe tube 9 starting point
+                                if state.tubes.len() > 9 {
+                                    state.tubes[9].p0 = [collector_x, 0.0];
+                                    state.tubes[9].p1 = [collector_x + 0.2, 0.0];
+                                    state.tubes[9].p2 = [collector_x + 0.5, 0.0];
+                                    state.tubes[9].p3 = [collector_x + 0.8, 0.0];
+                                }
+                                
+                                // Re-scale collector junction position
+                                if state.junctions.len() > 1 {
+                                    state.junctions[1].pos = [collector_x, 0.0];
+                                }
+                                
+                                state.reset_trigger = true;
+                            }
+                        }
                     }
                 });
                 
@@ -899,6 +955,27 @@ impl eframe::App for EngenApp {
                     ui.horizontal(|ui| {
                         ui.label("Simulated Time:");
                         ui.label(format!("{:.5} s", current_time));
+                    });
+                    
+                    ui.add_space(5.0);
+                    ui.separator();
+                    ui.add_space(5.0);
+                    ui.label(egui::RichText::new("Solver Profile Breakdown").strong().size(12.0));
+                    ui.horizontal(|ui| {
+                        ui.label("Tubes RHS:");
+                        ui.label(format!("{:.1} µs", solver_profile.tubes_rhs_us));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Tubes Update:");
+                        ui.label(format!("{:.1} µs", solver_profile.tubes_update_us));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Boundary Cond:");
+                        ui.label(format!("{:.1} µs", solver_profile.boundary_conditions_us));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Cylinder Physics:");
+                        ui.label(format!("{:.1} µs", solver_profile.cylinder_physics_us));
                     });
                 });
                 
@@ -1267,30 +1344,41 @@ impl eframe::App for EngenApp {
                         ui.add_space(5.0);
                         ui.label(egui::RichText::new("Cylinder Pressure vs. Crank Angle (PV/θ Curve)").strong());
                         
-                        let cyl_history = {
+                        let cyl_histories = {
                             let state = self.shared_state.lock().unwrap();
-                            state.cyl_pressure_history.clone()
+                            state.cyl_pressure_histories.clone()
                         };
                         
-                        let points: PlotPoints = cyl_history
-                            .iter()
-                            .map(|&[angle, p]| [angle as f64, (p / 1000.0) as f64]) // Pa to kPa
-                            .collect();
+                        let colors = [
+                            egui::Color32::from_rgb(50, 205, 50),   // Green
+                            egui::Color32::from_rgb(0, 191, 255),   // Deep Sky Blue
+                            egui::Color32::from_rgb(255, 165, 0),   // Orange
+                            egui::Color32::from_rgb(255, 105, 180),  // Hot Pink
+                        ];
                         
-                        let line = Line::new(points).color(egui::Color32::from_rgb(50, 205, 50)).width(2.0);
                         let plot = Plot::new("cylinder_pressure_plot")
-                            .height(120.0)
+                            .height(140.0)
                             .show_grid(true)
                             .x_axis_label("Crank Angle (degrees)")
                             .y_axis_label("Pressure (kPa)")
                             .include_x(0.0)
                             .include_x(720.0)
                             .include_y(0.0)
-                            .include_y(2000.0); // Show up to 20 bar (2000 kPa)
+                            .include_y(2500.0); // Show up to 25 bar (2500 kPa)
                         
                         plot.show(ui, |plot_ui| {
                             plot_ui.hline(HLine::new((P_ATM / 1000.0) as f64).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
-                            plot_ui.line(line);
+                            for (i, history) in cyl_histories.iter().enumerate() {
+                                let points: PlotPoints = history
+                                    .iter()
+                                    .map(|&[angle, p]| [angle as f64, (p / 1000.0) as f64])
+                                    .collect();
+                                let line = Line::new(points)
+                                    .color(colors[i % colors.len()])
+                                    .width(2.0)
+                                    .name(format!("Cyl {}", i + 1));
+                                plot_ui.line(line);
+                            }
                         });
                     }
                 });
@@ -1795,7 +1883,7 @@ fn main() -> eframe::Result<()> {
         engine_crank_angle: 0.0,
         cylinder_pressure: P_ATM,
         cylinder_volume: 0.0,
-        cyl_pressure_history: Vec::new(),
+        cyl_pressure_histories: Vec::new(),
         engine_bore: 0.052,
         engine_stroke: 0.036,
         engine_conrod: 0.072,
@@ -1820,6 +1908,7 @@ fn main() -> eframe::Result<()> {
         residual_fraction: 0.0,
         last_misfire: false,
         misfire_count: 0,
+        profile: SolverProfile::default(),
     }));
     
     let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state), Arc::clone(&audio_buffer), Arc::clone(&filter_params));

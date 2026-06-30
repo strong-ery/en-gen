@@ -1,0 +1,15 @@
+engine:
+  bore: 0.067
+  stroke: 0.0425
+  conrod_length: 0.083
+  compression_ratio: 12.9
+  inertia: 0.003
+  viscous_friction: 0.0003
+  wall_friction: 0.025
+  heat_transfer: 30.0
+ecu:
+  target_idle_rpm: 1500.0
+  redline_rpm: 16000.0
+  target_afr: 14.7
+  manual_afr_control: false
+  ignition_timing_deg: 15.0

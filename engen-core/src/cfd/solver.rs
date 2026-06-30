@@ -110,9 +110,10 @@ pub struct Tube {
     pub left_boundary_flux: [f32; 3],
     pub right_boundary_flux: [f32; 3],
     
-    // Reflection filter variables
     pub left_last_r_out: f32,
     pub right_last_r_out: f32,
+    pub connected_left: bool,
+    pub connected_right: bool,
     
     // Jones mass flow derivative variables
     pub left_last_mass_flow: f32,
@@ -177,6 +178,8 @@ impl Tube {
             right_boundary_flux: [0.0; 3],
             left_last_r_out: atmospheric_r_plus(1.4),
             right_last_r_out: atmospheric_r_minus(1.4),
+            connected_left: false,
+            connected_right: false,
             left_last_mass_flow: 0.0,
             right_last_mass_flow: 0.0,
             species: Vec::new(),
@@ -380,7 +383,14 @@ fn is_radiating_open_bc(bc: BoundaryType) -> bool {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct SolverProfile {
+    pub tubes_rhs_us: f32,
+    pub tubes_update_us: f32,
+    pub boundary_conditions_us: f32,
+    pub cylinder_physics_us: f32,
+}
+
 pub struct Solver {
     pub tubes: Vec<Tube>,
     pub junctions: Vec<Junction>,
@@ -407,9 +417,37 @@ pub struct Solver {
     pub last_misfire: bool,
     pub misfire_count: u32,
     pub misfire_model: crate::combustion::MisfireModel,
+    pub profile: SolverProfile,
 }
 
 impl Solver {
+    pub fn update_connected_flags(&mut self) {
+        for tube in &mut self.tubes {
+            tube.connected_left = false;
+            tube.connected_right = false;
+        }
+        for j in &self.junctions {
+            for conn in &j.connections {
+                if conn.tube_id < self.tubes.len() {
+                    match conn.side {
+                        TubeSide::Left => self.tubes[conn.tube_id].connected_left = true,
+                        TubeSide::Right => self.tubes[conn.tube_id].connected_right = true,
+                    }
+                }
+            }
+        }
+        for cyl in &self.cylinders {
+            for conn in &cyl.connections {
+                if conn.tube_id < self.tubes.len() {
+                    match conn.side {
+                        TubeSide::Left => self.tubes[conn.tube_id].connected_left = true,
+                        TubeSide::Right => self.tubes[conn.tube_id].connected_right = true,
+                    }
+                }
+            }
+        }
+    }
+
     pub fn new_single_tube(config: RadiusProfile, left_bc: BoundaryType, right_bc: BoundaryType) -> Self {
         let r_mid = if config == RadiusProfile::ExpansionChamber { 0.05 } else { 0.02 };
         let tube = Tube::new(
@@ -427,7 +465,7 @@ impl Solver {
             left_bc,
             right_bc,
         );
-        Self {
+        let mut solver = Self {
             tubes: vec![tube],
             junctions: Vec::new(),
             limiter: LimiterType::VanLeer,
@@ -451,7 +489,10 @@ impl Solver {
             last_misfire: false,
             misfire_count: 0,
             misfire_model: crate::combustion::MisfireModel::new(),
-        }
+            profile: SolverProfile::default(),
+        };
+        solver.update_connected_flags();
+        solver
     }
 
     pub fn new_y_junction() -> Self {
@@ -527,7 +568,7 @@ impl Solver {
             species_temp: AIR_Y,
         };
 
-        Self {
+        let mut solver = Self {
             tubes: vec![main_tube, branch_a, branch_b],
             junctions: vec![junction],
             limiter: LimiterType::VanLeer,
@@ -551,7 +592,10 @@ impl Solver {
             last_misfire: false,
             misfire_count: 0,
             misfire_model: crate::combustion::MisfireModel::new(),
-        }
+            profile: SolverProfile::default(),
+        };
+        solver.update_connected_flags();
+        solver
     }
 
     pub fn new_single_cylinder() -> Self {
@@ -613,7 +657,7 @@ impl Solver {
         // Crankshaft with 0.01 kg*m^2 inertia (suitable for small 4-stroke) and 0.001 viscous friction
         let crankshaft = Crankshaft::new(0.01, 0.001);
 
-        Self {
+        let mut solver = Self {
             tubes: vec![intake_tube, exhaust_tube],
             junctions: Vec::new(),
             limiter: LimiterType::VanLeer,
@@ -637,7 +681,319 @@ impl Solver {
             last_misfire: false,
             misfire_count: 0,
             misfire_model: crate::combustion::MisfireModel::new(),
-        }
+            profile: SolverProfile::default(),
+        };
+        solver.update_connected_flags();
+        solver
+    }
+
+    pub fn new_inline_four() -> Self {
+        let config = match crate::config::FullConfig::load_from_file("config/engine_preset.yaml") {
+            Ok(c) => c,
+            Err(_) => {
+                let default_cfg = crate::config::FullConfig::default();
+                let _ = std::fs::create_dir_all("config");
+                let _ = default_cfg.save_to_file("config/engine_preset.yaml");
+                default_cfg
+            }
+        };
+
+        let pi = std::f32::consts::PI;
+
+        // Tube 0: Main Intake Pipe (Atmosphere -> Plenum Junction)
+        let tube0 = Tube::new(
+            0,
+            "Intake Main".to_string(),
+            20,
+            [-1.2, 0.0],
+            [-1.0, 0.0],
+            [-0.8, 0.0],
+            [-0.7, 0.0],
+            0.025, // 25mm radius
+            0.025,
+            0.025,
+            RadiusProfile::Linear,
+            BoundaryType::Valve { lift: 1.0 }, // Throttle
+            BoundaryType::Closed,
+        );
+
+        // Tube 1: Intake Runner 1
+        let tube1 = Tube::new(
+            1,
+            "Intake Runner 1".to_string(),
+            10,
+            [-0.7, 0.0],
+            [-0.6, 0.2],
+            [-0.5, 0.4],
+            [-0.4, 0.6],
+            0.018, // 18mm radius
+            0.018,
+            0.018,
+            RadiusProfile::Linear,
+            BoundaryType::Closed,
+            BoundaryType::Valve { lift: 0.0 }, // Intake valve 1
+        );
+
+        // Tube 2: Intake Runner 2
+        let tube2 = Tube::new(
+            2,
+            "Intake Runner 2".to_string(),
+            10,
+            [-0.7, 0.0],
+            [-0.6, 0.1],
+            [-0.5, 0.15],
+            [-0.4, 0.2],
+            0.018,
+            0.018,
+            0.018,
+            RadiusProfile::Linear,
+            BoundaryType::Closed,
+            BoundaryType::Valve { lift: 0.0 }, // Intake valve 2
+        );
+
+        // Tube 3: Intake Runner 3
+        let tube3 = Tube::new(
+            3,
+            "Intake Runner 3".to_string(),
+            10,
+            [-0.7, 0.0],
+            [-0.6, -0.1],
+            [-0.5, -0.15],
+            [-0.4, -0.2],
+            0.018,
+            0.018,
+            0.018,
+            RadiusProfile::Linear,
+            BoundaryType::Closed,
+            BoundaryType::Valve { lift: 0.0 }, // Intake valve 3
+        );
+
+        // Tube 4: Intake Runner 4
+        let tube4 = Tube::new(
+            4,
+            "Intake Runner 4".to_string(),
+            10,
+            [-0.7, 0.0],
+            [-0.6, -0.2],
+            [-0.5, -0.4],
+            [-0.4, -0.6],
+            0.018,
+            0.018,
+            0.018,
+            RadiusProfile::Linear,
+            BoundaryType::Closed,
+            BoundaryType::Valve { lift: 0.0 }, // Intake valve 4
+        );
+
+        // Tube 5: Exhaust Header 1
+        let tube5 = Tube::new(
+            5,
+            "Header 1".to_string(),
+            15,
+            [-0.2, 0.6],
+            [0.0, 0.4],
+            [0.2, 0.2],
+            [0.4, 0.0],
+            0.016, // 16mm radius
+            0.016,
+            0.016,
+            RadiusProfile::Linear,
+            BoundaryType::Valve { lift: 0.0 }, // Exhaust valve 1
+            BoundaryType::Closed,
+        );
+
+        // Tube 6: Exhaust Header 2
+        let tube6 = Tube::new(
+            6,
+            "Header 2".to_string(),
+            15,
+            [-0.2, 0.2],
+            [0.0, 0.1],
+            [0.2, 0.05],
+            [0.4, 0.0],
+            0.016,
+            0.016,
+            0.016,
+            RadiusProfile::Linear,
+            BoundaryType::Valve { lift: 0.0 }, // Exhaust valve 2
+            BoundaryType::Closed,
+        );
+
+        // Tube 7: Exhaust Header 3
+        let tube7 = Tube::new(
+            7,
+            "Header 3".to_string(),
+            15,
+            [-0.2, -0.2],
+            [0.0, -0.1],
+            [0.2, -0.05],
+            [0.4, 0.0],
+            0.016,
+            0.016,
+            0.016,
+            RadiusProfile::Linear,
+            BoundaryType::Valve { lift: 0.0 }, // Exhaust valve 3
+            BoundaryType::Closed,
+        );
+
+        // Tube 8: Exhaust Header 4
+        let tube8 = Tube::new(
+            8,
+            "Header 4".to_string(),
+            15,
+            [-0.2, -0.6],
+            [0.0, -0.4],
+            [0.2, -0.2],
+            [0.4, 0.0],
+            0.016,
+            0.016,
+            0.016,
+            RadiusProfile::Linear,
+            BoundaryType::Valve { lift: 0.0 }, // Exhaust valve 4
+            BoundaryType::Closed,
+        );
+
+        // Tube 9: Main Exhaust Pipe (Collector -> Atmosphere)
+        let tube9 = Tube::new(
+            9,
+            "Main Exhaust".to_string(),
+            30,
+            [0.4, 0.0],
+            [0.6, 0.0],
+            [0.9, 0.0],
+            [1.2, 0.0],
+            0.022, // 22mm radius
+            0.022,
+            0.022,
+            RadiusProfile::Linear,
+            BoundaryType::Closed,
+            BoundaryType::Open,
+        );
+
+        // --- Junction 0 (Intake Plenum) ---
+        let vol_0 = (tube0.area[tube0.num_cells] * tube0.dx +
+                     tube1.area[1] * tube1.dx +
+                     tube2.area[1] * tube2.dx +
+                     tube3.area[1] * tube3.dx +
+                     tube4.area[1] * tube4.dx) * 0.5;
+
+        let j0 = Junction {
+            id: 0,
+            pos: [-0.7, 0.0],
+            connections: vec![
+                JunctionConnection { tube_id: 0, side: TubeSide::Right },
+                JunctionConnection { tube_id: 1, side: TubeSide::Left },
+                JunctionConnection { tube_id: 2, side: TubeSide::Left },
+                JunctionConnection { tube_id: 3, side: TubeSide::Left },
+                JunctionConnection { tube_id: 4, side: TubeSide::Left },
+            ],
+            rho: RHO_ATM,
+            e: P_ATM / (1.4 - 1.0),
+            volume: vol_0,
+            species: AIR_Y,
+            species_temp: AIR_Y,
+        };
+
+        // --- Junction 1 (Exhaust Collector) ---
+        let vol_1 = (tube5.area[tube5.num_cells] * tube5.dx +
+                     tube6.area[tube6.num_cells] * tube6.dx +
+                     tube7.area[tube7.num_cells] * tube7.dx +
+                     tube8.area[tube8.num_cells] * tube8.dx +
+                     tube9.area[1] * tube9.dx) * 0.5;
+
+        let j1 = Junction {
+            id: 1,
+            pos: [0.4, 0.0],
+            connections: vec![
+                JunctionConnection { tube_id: 5, side: TubeSide::Right },
+                JunctionConnection { tube_id: 6, side: TubeSide::Right },
+                JunctionConnection { tube_id: 7, side: TubeSide::Right },
+                JunctionConnection { tube_id: 8, side: TubeSide::Right },
+                JunctionConnection { tube_id: 9, side: TubeSide::Left },
+            ],
+            rho: RHO_ATM,
+            e: P_ATM / (1.4 - 1.0),
+            volume: vol_1,
+            species: AIR_Y,
+            species_temp: AIR_Y,
+        };
+
+        // --- Cylinders (ZX6R typical specs, loaded from config) ---
+        let bore = config.engine.bore;
+        let stroke = config.engine.stroke;
+        let conrod = config.engine.conrod_length;
+        let cr = config.engine.compression_ratio;
+
+        // Firing order 1-3-4-2: offsets are 0, 3*PI, PI, 2*PI
+        let cyl1 = Cylinder::new(
+            0, bore, stroke, conrod, cr,
+            vec![
+                CylinderConnection { tube_id: 1, side: TubeSide::Right, valve_type: ValveType::Intake },
+                CylinderConnection { tube_id: 5, side: TubeSide::Left, valve_type: ValveType::Exhaust },
+            ]
+        ).with_offset(0.0);
+
+        let cyl2 = Cylinder::new(
+            1, bore, stroke, conrod, cr,
+            vec![
+                CylinderConnection { tube_id: 2, side: TubeSide::Right, valve_type: ValveType::Intake },
+                CylinderConnection { tube_id: 6, side: TubeSide::Left, valve_type: ValveType::Exhaust },
+            ]
+        ).with_offset(3.0 * pi);
+
+        let cyl3 = Cylinder::new(
+            2, bore, stroke, conrod, cr,
+            vec![
+                CylinderConnection { tube_id: 3, side: TubeSide::Right, valve_type: ValveType::Intake },
+                CylinderConnection { tube_id: 7, side: TubeSide::Left, valve_type: ValveType::Exhaust },
+            ]
+        ).with_offset(1.0 * pi);
+
+        let cyl4 = Cylinder::new(
+            3, bore, stroke, conrod, cr,
+            vec![
+                CylinderConnection { tube_id: 4, side: TubeSide::Right, valve_type: ValveType::Intake },
+                CylinderConnection { tube_id: 8, side: TubeSide::Left, valve_type: ValveType::Exhaust },
+            ]
+        ).with_offset(2.0 * pi);
+
+        // Crankshaft with configuration parameters
+        let crankshaft = Crankshaft::new(config.engine.inertia, config.engine.viscous_friction);
+
+        let mut ecu = Ecu::new();
+        ecu.redline_rpm = config.ecu.redline_rpm;
+        ecu.target_idle_rpm = config.ecu.target_idle_rpm;
+        ecu.target_afr = config.ecu.target_afr;
+        ecu.manual_afr_control = config.ecu.manual_afr_control;
+
+        let mut solver = Self {
+            tubes: vec![tube0, tube1, tube2, tube3, tube4, tube5, tube6, tube7, tube8, tube9],
+            junctions: vec![j0, j1],
+            limiter: LimiterType::VanLeer,
+            friction: config.engine.wall_friction,
+            heat_transfer: config.engine.heat_transfer,
+            t: 0.0,
+            reflection_filter: 0.75,
+            step_counter: 0,
+            cached_dt_stable: 0.0,
+            crankshaft: Some(crankshaft),
+            cylinders: vec![cyl1, cyl2, cyl3, cyl4],
+            ignition_on: true,
+            ignition_timing_deg: config.ecu.ignition_timing_deg,
+            target_afr: config.ecu.target_afr,
+            throttle_input: 1.0,
+            starter_active: false,
+            ecu,
+            last_cylinder_afr: config.ecu.target_afr,
+            last_cylinder_lambda: config.ecu.target_afr / 14.7,
+            last_residual_fraction: 0.0,
+            last_misfire: false,
+            misfire_count: 0,
+            misfire_model: crate::combustion::MisfireModel::new(),
+            profile: SolverProfile::default(),
+        };
+        solver.update_connected_flags();
+        solver
     }
 
     pub fn inject_pulse(&mut self, amplitude_pa: f32, width_m: f32) {
@@ -723,9 +1079,7 @@ impl Solver {
         let heat_transfer = self.heat_transfer;
         
         for (k, tube) in self.tubes.iter_mut().enumerate() {
-            let (left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, false);
-            tube.left_boundary_flux = left_flux;
-            tube.right_boundary_flux = right_flux;
+            Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, false);
             
             let connected_left = self.junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube.id && c.side == TubeSide::Left));
             let connected_right = self.junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube.id && c.side == TubeSide::Right));
@@ -765,6 +1119,13 @@ impl Solver {
         let gamma = 1.4;
         let num_tubes = self.tubes.len();
 
+        let mut t_rhs = 0.0;
+        let mut t_update = 0.0;
+        let mut t_bc = 0.0;
+        let mut t_cyl = 0.0;
+
+        let t_start_cyl = std::time::Instant::now();
+
         // 0. Update ECU State
         if let Some(ref crank) = self.crankshaft {
             let rpm = crank.omega * 60.0 / (2.0 * std::f32::consts::PI);
@@ -795,7 +1156,7 @@ impl Solver {
             let mut pressure_torque = 0.0;
             for cyl in &self.cylinders {
                 let force = (cyl.p - P_ATM) * cyl.piston_area;
-                let dy_dtheta = piston_dy_dtheta(crank.theta, cyl.stroke, cyl.conrod_length);
+                let dy_dtheta = piston_dy_dtheta(crank.theta + cyl.crank_pin_offset_radians, cyl.stroke, cyl.conrod_length);
                 pressure_torque += force * dy_dtheta;
             }
             
@@ -814,7 +1175,7 @@ impl Solver {
             // Calculate new volumes and volume increments (delta_vol)
             for cyl in &mut self.cylinders {
                 let v_old = cyl.volume;
-                let v_new = cyl.volume_at(crank.theta);
+                let v_new = cyl.volume_at(crank.theta + cyl.crank_pin_offset_radians);
                 cyl.volume = v_new;
                 cyl.delta_vol = v_new - v_old;
             }
@@ -825,7 +1186,7 @@ impl Solver {
                     for conn in &cyl.connections {
                         if conn.valve_type == ValveType::Intake {
                             let (open_a, close_a) = (350.0f32.to_radians(), 570.0f32.to_radians());
-                            let lift = get_valve_lift(crank.theta, open_a, close_a);
+                            let lift = get_valve_lift(crank.theta + cyl.crank_pin_offset_radians, open_a, close_a);
                             if lift > 0.0 {
                                 let tube = &mut self.tubes[conn.tube_id];
                                 let m = tube.num_cells;
@@ -852,9 +1213,12 @@ impl Solver {
                 if self.ignition_on && !self.ecu.spark_cut {
                     let spark_angle = (4.0 * std::f32::consts::PI - self.ecu.ignition_timing_deg.to_radians()).rem_euclid(4.0 * std::f32::consts::PI);
                     
-                    // Check if spark_angle was crossed this step to trigger combustion
-                    let diff_target = (spark_angle - theta_old).rem_euclid(4.0 * std::f32::consts::PI);
-                    let diff_step = (theta_new - theta_old).rem_euclid(4.0 * std::f32::consts::PI);
+                    // Check if spark_angle was crossed this step to trigger combustion (using local crank angle with pin offset)
+                    let theta_old_cyl = (theta_old + cyl.crank_pin_offset_radians).rem_euclid(4.0 * std::f32::consts::PI);
+                    let theta_new_cyl = (theta_new + cyl.crank_pin_offset_radians).rem_euclid(4.0 * std::f32::consts::PI);
+                    
+                    let diff_target = (spark_angle - theta_old_cyl).rem_euclid(4.0 * std::f32::consts::PI);
+                    let diff_step = (theta_new_cyl - theta_old_cyl).rem_euclid(4.0 * std::f32::consts::PI);
                     
                     if diff_target < diff_step {
                         let lambda = crate::combustion::burn::lambda_from_species(cyl.species[crate::cfd::species::I_O2], cyl.species[crate::cfd::species::I_FUEL]);
@@ -923,23 +1287,24 @@ impl Solver {
                 }
             }
         }
+        t_cyl += t_start_cyl.elapsed().as_micros() as f32;
 
         // ------------------ SSP-RK2 Step 1 ------------------
+        let t_start_bc = std::time::Instant::now();
         self.apply_boundary_conditions();
+        t_bc += t_start_bc.elapsed().as_micros() as f32;
         
-        let mut step1_left_fluxes = Vec::with_capacity(num_tubes);
-        let mut step1_right_fluxes = Vec::with_capacity(num_tubes);
-        
+        let t_start_rhs = std::time::Instant::now();
         let limiter = self.limiter;
         let friction = self.friction;
         let heat_transfer = self.heat_transfer;
 
         for tube in &mut self.tubes {
-            let (left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, false);
-            step1_left_fluxes.push(left_flux);
-            step1_right_fluxes.push(right_flux);
+            Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, false);
         }
+        t_rhs += t_start_rhs.elapsed().as_micros() as f32;
 
+        let t_start_update = std::time::Instant::now();
         for tube in &mut self.tubes {
             for i in 1..=tube.num_cells {
                 for c in 0..3 {
@@ -958,9 +1323,9 @@ impl Solver {
             let mut dmass_species = [0.0f32; 4];
             
             for conn in &junction.connections {
-                let left_flux = step1_left_fluxes[conn.tube_id];
-                let right_flux = step1_right_fluxes[conn.tube_id];
                 let tube = &self.tubes[conn.tube_id];
+                let left_flux = tube.left_boundary_flux;
+                let right_flux = tube.right_boundary_flux;
                 match conn.side {
                     TubeSide::Left => {
                         let area = tube.area[1];
@@ -1008,7 +1373,7 @@ impl Solver {
             for conn in &cyl.connections {
                 let tube = &self.tubes[conn.tube_id];
                 let area = if conn.side == TubeSide::Left { tube.area[1] } else { tube.area[tube.num_cells] };
-                let flux = if conn.side == TubeSide::Left { step1_left_fluxes[conn.tube_id] } else { step1_right_fluxes[conn.tube_id] };
+                let flux = if conn.side == TubeSide::Left { tube.left_boundary_flux } else { tube.right_boundary_flux };
                 
                 let flow = match conn.side {
                     TubeSide::Left => -area * flux[0],
@@ -1052,8 +1417,10 @@ impl Solver {
             }
             crate::cfd::species::clamp_species(&mut cyl.species_temp);
         }
+        t_update += t_start_update.elapsed().as_micros() as f32;
 
         // ------------------ SSP-RK2 Step 2 ------------------
+        let t_start_bc = std::time::Instant::now();
         let filter_strength = self.reflection_filter;
         let crank_theta = self.crankshaft.as_ref().map(|c| c.theta);
         Self::apply_network_bc_cylinders(
@@ -1066,16 +1433,15 @@ impl Solver {
             gamma,
             filter_strength,
         );
+        t_bc += t_start_bc.elapsed().as_micros() as f32;
         
-        let mut step2_left_fluxes = Vec::with_capacity(num_tubes);
-        let mut step2_right_fluxes = Vec::with_capacity(num_tubes);
-        
+        let t_start_rhs = std::time::Instant::now();
         for tube in &mut self.tubes {
-            let (left_flux, right_flux) = Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, true);
-            step2_left_fluxes.push(left_flux);
-            step2_right_fluxes.push(right_flux);
+            Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, true);
         }
+        t_rhs += t_start_rhs.elapsed().as_micros() as f32;
 
+        let t_start_update = std::time::Instant::now();
         for tube in &mut self.tubes {
             for i in 1..=tube.num_cells {
                 for c in 0..3 {
@@ -1112,9 +1478,9 @@ impl Solver {
             let mut dmass_species = [0.0f32; 4];
             
             for conn in &junction.connections {
-                let left_flux = step2_left_fluxes[conn.tube_id];
-                let right_flux = step2_right_fluxes[conn.tube_id];
                 let tube = &self.tubes[conn.tube_id];
+                let left_flux = tube.left_boundary_flux;
+                let right_flux = tube.right_boundary_flux;
                 match conn.side {
                     TubeSide::Left => {
                         let area = tube.area[1];
@@ -1164,7 +1530,7 @@ impl Solver {
             for conn in &cyl.connections {
                 let tube = &self.tubes[conn.tube_id];
                 let area = if conn.side == TubeSide::Left { tube.area[1] } else { tube.area[tube.num_cells] };
-                let flux = if conn.side == TubeSide::Left { step2_left_fluxes[conn.tube_id] } else { step2_right_fluxes[conn.tube_id] };
+                let flux = if conn.side == TubeSide::Left { tube.left_boundary_flux } else { tube.right_boundary_flux };
                 
                 let flow = match conn.side {
                     TubeSide::Left => -area * flux[0],
@@ -1214,10 +1580,17 @@ impl Solver {
             // Derive residual fraction: Y_CO2 + Y_EXHAUST
             cyl.residual_fraction = cyl.species[crate::cfd::species::I_CO2] + cyl.species[crate::cfd::species::I_EXHAUST];
         }
+        t_update += t_start_update.elapsed().as_micros() as f32;
 
+        let t_start_bc = std::time::Instant::now();
         self.apply_boundary_conditions();
-        
-        self.t += dt;
+        t_bc += t_start_bc.elapsed().as_micros() as f32;
+
+        let alpha = 0.05;
+        self.profile.tubes_rhs_us = self.profile.tubes_rhs_us * (1.0 - alpha) + alpha * t_rhs;
+        self.profile.tubes_update_us = self.profile.tubes_update_us * (1.0 - alpha) + alpha * t_update;
+        self.profile.boundary_conditions_us = self.profile.boundary_conditions_us * (1.0 - alpha) + alpha * t_bc;
+        self.profile.cylinder_physics_us = self.profile.cylinder_physics_us * (1.0 - alpha) + alpha * t_cyl;
     }
 
     pub fn apply_boundary_conditions(&mut self) {
@@ -1525,7 +1898,7 @@ impl Solver {
                         ValveType::Intake => (350.0f32.to_radians(), 570.0f32.to_radians()),
                         ValveType::Exhaust => (140.0f32.to_radians(), 380.0f32.to_radians()),
                     };
-                    get_valve_lift(theta, open_a, close_a)
+                    get_valve_lift(theta + cyl.crank_pin_offset_radians, open_a, close_a)
                 } else {
                     // Default to fully open if no crank is present (e.g. static tests)
                     1.0
@@ -1642,7 +2015,7 @@ impl Solver {
     #[allow(non_snake_case)]
     fn apply_network_bc(
         tubes: &mut Vec<Tube>,
-        junctions: &Vec<Junction>,
+        _junctions: &Vec<Junction>,
         use_temp: bool,
         j_states: &Vec<Junction>,
         gamma: f32,
@@ -1652,11 +2025,10 @@ impl Solver {
         
         for k in 0..tubes.len() {
             let m = tubes[k].num_cells;
-            let id = tubes[k].id;
             let left_bc = tubes[k].left_bc;
             let right_bc = tubes[k].right_bc;
-            let connected_left = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == id && c.side == TubeSide::Left));
-            let connected_right = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == id && c.side == TubeSide::Right));
+            let connected_left = tubes[k].connected_left;
+            let connected_right = tubes[k].connected_right;
             let left_radiating = !connected_left && is_radiating_open_bc(left_bc);
             let right_radiating = !connected_right && is_radiating_open_bc(right_bc);
             // Dual-open ends form a resonant cavity; absorb reflections more aggressively at idle.
@@ -1942,7 +2314,7 @@ impl Solver {
         heat_transfer: f32,
         tube: &mut Tube,
         use_temp: bool,
-    ) -> ([f32; 3], [f32; 3]) {
+    ) {
         let num_cells = tube.num_cells;
         let dx = tube.dx;
         let gamma = 1.4;
@@ -2101,7 +2473,8 @@ impl Solver {
             tube.right_species_flux[k] = right_mass_flux * right_upwind[k];
         }
 
-        (left_flux, right_flux)
+        tube.left_boundary_flux = left_flux;
+        tube.right_boundary_flux = right_flux;
     }
 }
 
@@ -2574,6 +2947,42 @@ mod tests {
         assert!(solver.misfire_count >= 1, "Misfire count did not increment");
         let energy_diff = (solver.cylinders[0].energy - init_energy).abs();
         assert!(energy_diff < 0.05, "Cylinder energy changed significantly: energy_diff = {}", energy_diff);
+    }
+
+    #[test]
+    fn test_inline_four_firing_order() {
+        let solver = Solver::new_inline_four();
+        assert_eq!(solver.cylinders.len(), 4);
+        
+        // Firing order is 1-3-4-2. Pin offsets should match:
+        assert_eq!(solver.cylinders[0].crank_pin_offset_radians, 0.0);
+        assert_eq!(solver.cylinders[1].crank_pin_offset_radians, 3.0 * std::f32::consts::PI);
+        assert_eq!(solver.cylinders[2].crank_pin_offset_radians, 1.0 * std::f32::consts::PI);
+        assert_eq!(solver.cylinders[3].crank_pin_offset_radians, 2.0 * std::f32::consts::PI);
+    }
+
+    #[test]
+    fn test_yaml_config_loading() {
+        use crate::config::FullConfig;
+        
+        // Save a temporary config file
+        let mut config = FullConfig::default();
+        config.engine.bore = 0.075;
+        config.engine.stroke = 0.055;
+        config.ecu.target_idle_rpm = 1800.0;
+        
+        let path = "config/temp_test_config.yaml";
+        let _ = std::fs::create_dir_all("config");
+        config.save_to_file(path).expect("Failed to save YAML config");
+        
+        // Load it back
+        let loaded = FullConfig::load_from_file(path).expect("Failed to load YAML config");
+        assert_eq!(loaded.engine.bore, 0.075);
+        assert_eq!(loaded.engine.stroke, 0.055);
+        assert_eq!(loaded.ecu.target_idle_rpm, 1800.0);
+        
+        // Cleanup
+        let _ = std::fs::remove_file(path);
     }
 }
 

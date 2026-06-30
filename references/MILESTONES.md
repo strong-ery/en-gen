@@ -70,7 +70,7 @@ Single fixed-width tube, atmosphere BCs, pressure pulse injected at t=0. Live eg
 
 ---
 
-## Milestone 6 — Combustion Quality & Species Tracking
+## Milestone 6 ✅ — Combustion Quality & Species Tracking
 **Goal:** Realistic burn shape and mixture-dependent combustion.
 
 - Wiebe burn fraction curve replaces instantaneous energy release

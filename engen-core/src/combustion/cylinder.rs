@@ -45,6 +45,9 @@ pub struct Cylinder {
     pub residual_fraction: f32,
     pub initial_fuel_fraction: f32,
     
+    // Crankshaft phase offset
+    pub crank_pin_offset_radians: f32,
+    
     // Valve and manifold coupling connections
     pub connections: Vec<CylinderConnection>,
     pub combustion_phase: f32,
@@ -86,6 +89,7 @@ impl Cylinder {
             species_temp: AIR_Y,
             residual_fraction: 0.0,
             initial_fuel_fraction: 0.0,
+            crank_pin_offset_radians: 0.0,
             connections,
             combustion_phase: -1.0,
         };
@@ -93,9 +97,15 @@ impl Cylinder {
         cyl
     }
 
+    pub fn with_offset(mut self, offset_radians: f32) -> Self {
+        self.crank_pin_offset_radians = offset_radians;
+        self.reset_state();
+        self
+    }
+
     /// Reset thermodynamics state to quiescent atmosphere at TDC volume.
     pub fn reset_state(&mut self) {
-        let init_theta = 0.0; // TDC
+        let init_theta = 0.0 + self.crank_pin_offset_radians; // TDC with offset
         self.volume = self.volume_at(init_theta);
         self.delta_vol = 0.0;
         
