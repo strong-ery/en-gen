@@ -1,4 +1,5 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// TEMP: disabled for debugging - re-enable once throttle/RPM issue is diagnosed
+// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
 use egui_plot::{Plot, Line, HLine, PlotPoints};
@@ -136,6 +137,7 @@ fn spawn_solver_thread(
         
         let mut local_jones_history = Vec::new();
         let mut local_audio_buf: Vec<f32> = Vec::with_capacity(128);
+        let mut debug_print_counter: u32 = 0;
         
         loop {
             let mut inject = false;
@@ -190,7 +192,7 @@ fn spawn_solver_thread(
                     // Starter motor: apply sustained cranking torque
                     if let Some(ref mut crank) = solver.crankshaft {
                         if state.starter_engaged && state.starter_timer > 0.0 {
-                            crank.starter_torque = 45.0; // N*m at the crank - enough to push through compression stroke resistance
+                            crank.starter_torque = 90.0; // N*m at the crank - upped again now that Coulomb friction/compression resistance is higher
                             
                             // Auto-disengage once engine catches (sustained above 600 RPM)
                             let rpm = (crank.omega * 60.0) / (2.0 * std::f32::consts::PI);
@@ -209,7 +211,7 @@ fn spawn_solver_thread(
                     
                     // Throttle mapping with idle air bypass (minimum 3% opening)
                     if solver.crankshaft.is_some() && !solver.tubes.is_empty() {
-                        let lift = state.throttle.max(0.03); // idle bypass
+                        let lift = state.throttle.max(0.004); // idle bypass - tightened from 0.03, which was saturating cylinder fill at idle dwell times
                         solver.tubes[0].left_bc = BoundaryType::Valve { lift };
                     }
                     
@@ -416,6 +418,22 @@ fn spawn_solver_thread(
                                 state.cyl_pressure_history.push([angle_deg, cyl.p]);
                                 if state.cyl_pressure_history.len() > 360 {
                                     state.cyl_pressure_history.remove(0);
+                                }
+
+                                // TEMP DEBUG: print throttle/lift/rpm/cyl mass once per second
+                                // to verify the throttle value is actually reaching tube 0 and
+                                // actually changing trapped cylinder mass. Remove once diagnosed.
+                                debug_print_counter += 1;
+                                if debug_print_counter >= 60 {
+                                    debug_print_counter = 0;
+                                    let lift = match solver.tubes[0].left_bc {
+                                        BoundaryType::Valve { lift } => lift,
+                                        _ => -1.0,
+                                    };
+                                    eprintln!(
+                                        "[DEBUG] throttle={:.3} tube0_left_lift={:.3} rpm={:.0} cyl_mass={:.6} cyl_p={:.0}",
+                                        state.throttle, lift, state.engine_rpm, cyl.mass, cyl.p
+                                    );
                                 }
                             }
                         } else {
@@ -1663,7 +1681,7 @@ fn main() -> eframe::Result<()> {
         engine_conrod: 0.16,
         engine_compression_ratio: 9.0,
         engine_inertia: 0.08,
-        engine_friction: 0.05,
+        engine_friction: 0.12,
         spin_rpm: 1200.0,
         trigger_spin: false,
         throttle: 1.0,
