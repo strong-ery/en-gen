@@ -1,5 +1,5 @@
 // TEMP: disabled for debugging - re-enable once throttle/RPM issue is diagnosed
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
 use egui_plot::{Plot, Line, HLine, PlotPoints};

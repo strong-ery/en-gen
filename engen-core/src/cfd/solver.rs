@@ -83,6 +83,21 @@ pub struct Junction {
 
 use crate::cfd::species::AIR_Y;
 
+impl Junction {
+    /// Copies only the mutable simulation state from `other`, leaving
+    /// `connections` (and other static fields) untouched. Used instead of
+    /// `Vec<Junction>::clone_from`, since derived Clone doesn't override
+    /// clone_from and falls back to full per-field clone() on each element,
+    /// reallocating `connections` every substep even though it never changes.
+    #[inline]
+    fn copy_state_from(&mut self, other: &Junction) {
+        self.rho = other.rho;
+        self.e = other.e;
+        self.species = other.species;
+        self.species_temp = other.species_temp;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Tube {
     pub id: usize,
@@ -394,6 +409,7 @@ pub struct SolverProfile {
 pub struct Solver {
     pub tubes: Vec<Tube>,
     pub junctions: Vec<Junction>,
+    pub junctions_temp: Vec<Junction>,
     pub limiter: LimiterType,
     pub friction: f32,
     pub heat_transfer: f32,
@@ -418,6 +434,7 @@ pub struct Solver {
     pub misfire_count: u32,
     pub misfire_model: crate::combustion::MisfireModel,
     pub profile: SolverProfile,
+    initial_mass_flows: Vec<(f32, f32)>,
 }
 
 impl Solver {
@@ -468,6 +485,7 @@ impl Solver {
         let mut solver = Self {
             tubes: vec![tube],
             junctions: Vec::new(),
+            junctions_temp: Vec::new(),
             limiter: LimiterType::VanLeer,
             friction: 0.0,
             heat_transfer: 0.0,
@@ -490,6 +508,7 @@ impl Solver {
             misfire_count: 0,
             misfire_model: crate::combustion::MisfireModel::new(),
             profile: SolverProfile::default(),
+            initial_mass_flows: Vec::new(),
         };
         solver.update_connected_flags();
         solver
@@ -571,6 +590,7 @@ impl Solver {
         let mut solver = Self {
             tubes: vec![main_tube, branch_a, branch_b],
             junctions: vec![junction],
+            junctions_temp: Vec::new(),
             limiter: LimiterType::VanLeer,
             friction: 0.0,
             heat_transfer: 0.0,
@@ -593,6 +613,7 @@ impl Solver {
             misfire_count: 0,
             misfire_model: crate::combustion::MisfireModel::new(),
             profile: SolverProfile::default(),
+            initial_mass_flows: Vec::new(),
         };
         solver.update_connected_flags();
         solver
@@ -660,6 +681,7 @@ impl Solver {
         let mut solver = Self {
             tubes: vec![intake_tube, exhaust_tube],
             junctions: Vec::new(),
+            junctions_temp: Vec::new(),
             limiter: LimiterType::VanLeer,
             friction: 0.025,
             heat_transfer: 30.0,
@@ -682,6 +704,7 @@ impl Solver {
             misfire_count: 0,
             misfire_model: crate::combustion::MisfireModel::new(),
             profile: SolverProfile::default(),
+            initial_mass_flows: Vec::new(),
         };
         solver.update_connected_flags();
         solver
@@ -969,6 +992,7 @@ impl Solver {
         let mut solver = Self {
             tubes: vec![tube0, tube1, tube2, tube3, tube4, tube5, tube6, tube7, tube8, tube9],
             junctions: vec![j0, j1],
+            junctions_temp: Vec::new(),
             limiter: LimiterType::VanLeer,
             friction: config.engine.wall_friction,
             heat_transfer: config.engine.heat_transfer,
@@ -991,6 +1015,7 @@ impl Solver {
             misfire_count: 0,
             misfire_model: crate::combustion::MisfireModel::new(),
             profile: SolverProfile::default(),
+            initial_mass_flows: Vec::new(),
         };
         solver.update_connected_flags();
         solver
@@ -1051,10 +1076,12 @@ impl Solver {
         
         // Determine number of sub-steps
         let n_steps = ((dt / dt_stable).ceil().max(1.0) as usize).min(200);
+        //eprintln!("n_steps={} dt={} dt_stable={}", n_steps, dt, dt_stable);
         let sub_dt = dt / n_steps as f32;
         
-        // Store starting mass flows for correct derivative calculation over the full dt
-        let mut initial_mass_flows = Vec::with_capacity(self.tubes.len());
+        // Store starting mass flows for correct derivative calculation over the full dt.
+        // Reuses a persistent buffer instead of allocating a new Vec every step().
+        self.initial_mass_flows.clear();
         for tube in &self.tubes {
             let left_flow = {
                 let w1 = conserved_to_primitive(&tube.u[1], gamma);
@@ -1064,7 +1091,7 @@ impl Solver {
                 let wm = conserved_to_primitive(&tube.u[tube.num_cells], gamma);
                 wm[0] * wm[1] * tube.area[tube.num_cells]
             };
-            initial_mass_flows.push((left_flow, right_flow));
+            self.initial_mass_flows.push((left_flow, right_flow));
         }
         
         // Evolve system by sub-stepping
@@ -1100,14 +1127,14 @@ impl Solver {
             if left_open && right_open {
                 // Net boundary mass flux avoids catastrophic cancellation between endpoints.
                 let net_flow = left_flow + right_flow;
-                let net_initial = initial_mass_flows[k].0 + initial_mass_flows[k].1;
+                let net_initial = self.initial_mass_flows[k].0 + self.initial_mass_flows[k].1;
                 net_jones += (net_flow - net_initial) / dt;
             } else {
                 if left_open {
-                    net_jones += (left_flow - initial_mass_flows[k].0) / dt;
+                    net_jones += (left_flow - self.initial_mass_flows[k].0) / dt;
                 }
                 if right_open {
-                    net_jones += (right_flow - initial_mass_flows[k].1) / dt;
+                    net_jones += (right_flow - self.initial_mass_flows[k].1) / dt;
                 }
             }
         }
@@ -1119,12 +1146,17 @@ impl Solver {
         let gamma = 1.4;
         let num_tubes = self.tubes.len();
 
+        // Only pay for Instant::now()/QueryPerformanceCounter syscalls on a
+        // sampled subset of substeps -- profiling every substep (up to 200x
+        // per step()) was dominating the profile itself.
+        let do_profile = self.step_counter % 64 == 0;
+
         let mut t_rhs = 0.0;
         let mut t_update = 0.0;
         let mut t_bc = 0.0;
         let mut t_cyl = 0.0;
 
-        let t_start_cyl = std::time::Instant::now();
+        let t_start_cyl = if do_profile { Some(std::time::Instant::now()) } else { None };
 
         // 0. Update ECU State
         if let Some(ref crank) = self.crankshaft {
@@ -1191,10 +1223,10 @@ impl Solver {
                                 let tube = &mut self.tubes[conn.tube_id];
                                 let m = tube.num_cells;
                                 let lambda = self.ecu.target_afr / crate::cfd::species::AFR_STOICH;
-                                let cells_to_inject = if conn.side == TubeSide::Left {
-                                    vec![1, 2, 3]
+                                let cells_to_inject: [usize; 3] = if conn.side == TubeSide::Left {
+                                    [1, 2, 3]
                                 } else {
-                                    vec![m, m - 1, m - 2]
+                                    [m, m - 1, m - 2]
                                 };
                                 for cell_idx in cells_to_inject {
                                     let y_o2 = tube.species[cell_idx][crate::cfd::species::I_O2];
@@ -1287,14 +1319,14 @@ impl Solver {
                 }
             }
         }
-        t_cyl += t_start_cyl.elapsed().as_micros() as f32;
+        if let Some(t) = t_start_cyl { t_cyl += t.elapsed().as_micros() as f32; }
 
         // ------------------ SSP-RK2 Step 1 ------------------
-        let t_start_bc = std::time::Instant::now();
+        let t_start_bc = if do_profile { Some(std::time::Instant::now()) } else { None };
         self.apply_boundary_conditions();
-        t_bc += t_start_bc.elapsed().as_micros() as f32;
+        if let Some(t) = t_start_bc { t_bc += t.elapsed().as_micros() as f32; }
         
-        let t_start_rhs = std::time::Instant::now();
+        let t_start_rhs = if do_profile { Some(std::time::Instant::now()) } else { None };
         let limiter = self.limiter;
         let friction = self.friction;
         let heat_transfer = self.heat_transfer;
@@ -1302,9 +1334,9 @@ impl Solver {
         for tube in &mut self.tubes {
             Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, false);
         }
-        t_rhs += t_start_rhs.elapsed().as_micros() as f32;
+        if let Some(t) = t_start_rhs { t_rhs += t.elapsed().as_micros() as f32; }
 
-        let t_start_update = std::time::Instant::now();
+        let t_start_update = if do_profile { Some(std::time::Instant::now()) } else { None };
         for tube in &mut self.tubes {
             for i in 1..=tube.num_cells {
                 for c in 0..3 {
@@ -1316,7 +1348,16 @@ impl Solver {
             }
         }
 
-        let mut j1 = self.junctions.clone();
+        // Update state fields only -- avoids re-cloning each Junction's
+        // `connections` Vec (which never changes) every substep. Falls back
+        // to a full clone once if lengths don't match yet (e.g. first call).
+        if self.junctions_temp.len() != self.junctions.len() {
+            self.junctions_temp.clone_from(&self.junctions);
+        } else {
+            for (dst, src) in self.junctions_temp.iter_mut().zip(self.junctions.iter()) {
+                dst.copy_state_from(src);
+            }
+        }
         for (j_idx, junction) in self.junctions.iter().enumerate() {
             let mut dmass = 0.0;
             let mut denergy = 0.0;
@@ -1351,17 +1392,17 @@ impl Solver {
             }
 
             let new_rho = (junction.rho + (dt / junction.volume) * dmass).max(1e-4);
-            j1[j_idx].rho = new_rho;
-            j1[j_idx].e = (junction.e + (dt / junction.volume) * denergy).max(1e-2);
+            self.junctions_temp[j_idx].rho = new_rho;
+            self.junctions_temp[j_idx].e = (junction.e + (dt / junction.volume) * denergy).max(1e-2);
             
             let junction_mass_old = junction.rho * junction.volume;
             let junction_mass_new = new_rho * junction.volume;
             for k in 0..4 {
                 let m_species_old = junction_mass_old * junction.species[k];
                 let m_species_new = (m_species_old + dt * dmass_species[k]).max(0.0);
-                j1[j_idx].species_temp[k] = m_species_new / junction_mass_new.max(1e-6);
+                self.junctions_temp[j_idx].species_temp[k] = m_species_new / junction_mass_new.max(1e-6);
             }
-            crate::cfd::species::clamp_species(&mut j1[j_idx].species_temp);
+            crate::cfd::species::clamp_species(&mut self.junctions_temp[j_idx].species_temp);
         }
 
         // Step 1: Update Cylinder Temp States
@@ -1417,31 +1458,31 @@ impl Solver {
             }
             crate::cfd::species::clamp_species(&mut cyl.species_temp);
         }
-        t_update += t_start_update.elapsed().as_micros() as f32;
+        if let Some(t) = t_start_update { t_update += t.elapsed().as_micros() as f32; }
 
         // ------------------ SSP-RK2 Step 2 ------------------
-        let t_start_bc = std::time::Instant::now();
+        let t_start_bc = if do_profile { Some(std::time::Instant::now()) } else { None };
         let filter_strength = self.reflection_filter;
         let crank_theta = self.crankshaft.as_ref().map(|c| c.theta);
         Self::apply_network_bc_cylinders(
             &mut self.tubes,
             &self.junctions,
             true,
-            &j1,
+            &self.junctions_temp,
             &self.cylinders,
             crank_theta,
             gamma,
             filter_strength,
         );
-        t_bc += t_start_bc.elapsed().as_micros() as f32;
+        if let Some(t) = t_start_bc { t_bc += t.elapsed().as_micros() as f32; }
         
-        let t_start_rhs = std::time::Instant::now();
+        let t_start_rhs = if do_profile { Some(std::time::Instant::now()) } else { None };
         for tube in &mut self.tubes {
             Self::compute_rhs_internal(limiter, friction, heat_transfer, tube, true);
         }
-        t_rhs += t_start_rhs.elapsed().as_micros() as f32;
+        if let Some(t) = t_start_rhs { t_rhs += t.elapsed().as_micros() as f32; }
 
-        let t_start_update = std::time::Instant::now();
+        let t_start_update = if do_profile { Some(std::time::Instant::now()) } else { None };
         for tube in &mut self.tubes {
             for i in 1..=tube.num_cells {
                 for c in 0..3 {
@@ -1488,7 +1529,7 @@ impl Solver {
                         dmass += flow;
                         denergy -= area * left_flux[2];
                         for k in 0..4 {
-                            let y_upwind = if flow >= 0.0 { tube.species_temp[1][k] } else { j1[j_idx].species_temp[k] };
+                            let y_upwind = if flow >= 0.0 { tube.species_temp[1][k] } else { self.junctions_temp[j_idx].species_temp[k] };
                             dmass_species[k] += flow * y_upwind;
                         }
                     }
@@ -1498,23 +1539,23 @@ impl Solver {
                         dmass += flow;
                         denergy += area * right_flux[2];
                         for k in 0..4 {
-                            let y_upwind = if flow >= 0.0 { tube.species_temp[tube.num_cells][k] } else { j1[j_idx].species_temp[k] };
+                            let y_upwind = if flow >= 0.0 { tube.species_temp[tube.num_cells][k] } else { self.junctions_temp[j_idx].species_temp[k] };
                             dmass_species[k] += flow * y_upwind;
                         }
                     }
                 }
             }
 
-            let new_rho = (0.5 * junction.rho + 0.5 * j1[j_idx].rho + 0.5 * (dt / junction.volume) * dmass).max(1e-4);
+            let new_rho = (0.5 * junction.rho + 0.5 * self.junctions_temp[j_idx].rho + 0.5 * (dt / junction.volume) * dmass).max(1e-4);
             junction.rho = new_rho;
-            junction.e = (0.5 * junction.e + 0.5 * j1[j_idx].e + 0.5 * (dt / junction.volume) * denergy).max(1e-2);
+            junction.e = (0.5 * junction.e + 0.5 * self.junctions_temp[j_idx].e + 0.5 * (dt / junction.volume) * denergy).max(1e-2);
             
             let junction_mass = new_rho * junction.volume;
             let junction_mass_old = junction.rho * junction.volume;
-            let junction_mass_temp = j1[j_idx].rho * junction.volume;
+            let junction_mass_temp = self.junctions_temp[j_idx].rho * junction.volume;
             for k in 0..4 {
                 let m_species_old = junction_mass_old * junction.species[k];
-                let m_species_temp = junction_mass_temp * j1[j_idx].species_temp[k];
+                let m_species_temp = junction_mass_temp * self.junctions_temp[j_idx].species_temp[k];
                 let m_species_new = (0.5 * m_species_old + 0.5 * m_species_temp + 0.5 * dt * dmass_species[k]).max(0.0);
                 junction.species[k] = m_species_new / junction_mass.max(1e-6);
             }
@@ -1580,17 +1621,19 @@ impl Solver {
             // Derive residual fraction: Y_CO2 + Y_EXHAUST
             cyl.residual_fraction = cyl.species[crate::cfd::species::I_CO2] + cyl.species[crate::cfd::species::I_EXHAUST];
         }
-        t_update += t_start_update.elapsed().as_micros() as f32;
+        if let Some(t) = t_start_update { t_update += t.elapsed().as_micros() as f32; }
 
-        let t_start_bc = std::time::Instant::now();
+        let t_start_bc = if do_profile { Some(std::time::Instant::now()) } else { None };
         self.apply_boundary_conditions();
-        t_bc += t_start_bc.elapsed().as_micros() as f32;
+        if let Some(t) = t_start_bc { t_bc += t.elapsed().as_micros() as f32; }
 
         let alpha = 0.05;
-        self.profile.tubes_rhs_us = self.profile.tubes_rhs_us * (1.0 - alpha) + alpha * t_rhs;
-        self.profile.tubes_update_us = self.profile.tubes_update_us * (1.0 - alpha) + alpha * t_update;
-        self.profile.boundary_conditions_us = self.profile.boundary_conditions_us * (1.0 - alpha) + alpha * t_bc;
-        self.profile.cylinder_physics_us = self.profile.cylinder_physics_us * (1.0 - alpha) + alpha * t_cyl;
+        if do_profile {
+            self.profile.tubes_rhs_us = self.profile.tubes_rhs_us * (1.0 - alpha) + alpha * t_rhs;
+            self.profile.tubes_update_us = self.profile.tubes_update_us * (1.0 - alpha) + alpha * t_update;
+            self.profile.boundary_conditions_us = self.profile.boundary_conditions_us * (1.0 - alpha) + alpha * t_bc;
+            self.profile.cylinder_physics_us = self.profile.cylinder_physics_us * (1.0 - alpha) + alpha * t_cyl;
+        }
     }
 
     pub fn apply_boundary_conditions(&mut self) {
@@ -1769,6 +1812,21 @@ impl Solver {
         }
     }
 
+    #[inline(always)]
+    fn isentropic_phi(pr: f32) -> f32 {
+        if pr <= 0.52828 {
+            0.5787
+        } else {
+            let poly = 0.174087330145
+                     + pr * (1.845079102463
+                     + pr * (-1.619439906917
+                     + pr * (1.268381247447
+                     + pr * (-0.593403052591
+                     + pr * 0.120537101468))));
+            (1.0 - pr).max(0.0).sqrt() * poly
+        }
+    }
+
     fn solve_bisection_valve_res(
         r_in: f32,
         p_interior: f32,
@@ -1781,58 +1839,58 @@ impl Solver {
     ) -> f32 {
         let psi = lift.max(1e-4);
         let c_int = c_interior.max(1e-2);
-        
+
+        // Hoisted out of the per-iteration closure: these don't depend on
+        // v_out, so computing them once per solve instead of once per
+        // eval_residual call saves a division + 7th/5th power every iteration.
+        let inv_c_int7 = 1.0 / {
+            let c2 = c_int * c_int;
+            let c4 = c2 * c2;
+            let c6 = c4 * c2;
+            c6 * c_int
+        };
+        let inv_c_res5 = {
+            let c2 = c_res * c_res;
+            let c4 = c2 * c2;
+            1.0 / (c4 * c_res)
+        };
+
         let eval_residual = |v_out: f32| -> f32 {
             let c_bc = 0.2 * (r_in - v_out);
             if c_bc <= 0.0 {
                 return 1e6;
             }
-            
-            let p_bc = p_interior * (c_bc / c_int).powi(7);
-            
+
+            let c_bc2 = c_bc * c_bc;
+            let c_bc4 = c_bc2 * c_bc2;
+            let c_bc6 = c_bc4 * c_bc2;
+            let c_bc7 = c_bc6 * c_bc;
+            let p_bc = p_interior * c_bc7 * inv_c_int7;
+
             if p_bc >= p_res - 25.0 {
                 // Outflow
-                let pr = (p_res / p_bc.max(1e-3)).max(0.0).min(1.0);
-                let phi = if pr <= 0.52828 {
-                    0.5787
-                } else {
-                    let poly = 0.174087330145 
-                             + pr * (1.845079102463 
-                             + pr * (-1.619439906917 
-                             + pr * (1.268381247447 
-                             + pr * (-0.593403052591 
-                             + pr * 0.120537101468))));
-                    (1.0 - pr).max(0.0).sqrt() * poly
-                };
+                let pr = (p_res / p_bc.max(1e-3)).clamp(0.0, 1.0);
+                let phi = Self::isentropic_phi(pr);
                 let target_v = psi * c_bc * phi;
                 v_out - target_v
             } else {
                 // Inflow
-                let pr = (p_bc / p_res.max(1e-3)).max(0.0).min(1.0);
-                let phi = if pr <= 0.52828 {
-                    0.5787
-                } else {
-                    let poly = 0.174087330145 
-                             + pr * (1.845079102463 
-                             + pr * (-1.619439906917 
-                             + pr * (1.268381247447 
-                             + pr * (-0.593403052591 
-                             + pr * 0.120537101468))));
-                    (1.0 - pr).max(0.0).sqrt() * poly
-                };
-                let rho_bc = rho_res * (c_bc / c_res).powi(5);
+                let pr = (p_bc / p_res.max(1e-3)).clamp(0.0, 1.0);
+                let phi = Self::isentropic_phi(pr);
+                let c_bc5 = c_bc4 * c_bc;
+                let rho_bc = rho_res * c_bc5 * inv_c_res5;
                 let g = psi * rho_res * c_res * phi;
                 let target_v = -g / rho_bc.max(1e-3);
                 v_out - target_v
             }
         };
-        
+
         let mut low = -c_res - 200.0;
         let mut high = (r_in - 1e-3).max(low + 10.0);
-        
+
         let mut r_low = eval_residual(low);
         let mut r_high = eval_residual(high);
-        
+
         if r_low * r_high > 0.0 {
             if r_low > 0.0 {
                 for _ in 0..15 {
@@ -1856,18 +1914,40 @@ impl Solver {
                 }
             }
         }
-        
-        for _ in 0..25 {
-            let mid = 0.5 * (low + high);
-            let res = eval_residual(mid);
-            if res > 0.0 {
-                high = mid;
-            } else {
+
+        let mut result = 0.5 * (low + high);
+        let mut side = 0i32;
+        for _ in 0..12 {
+            let denom = r_high - r_low;
+            if denom.abs() < 1e-6 {
+                break;
+            }
+            let mid = (low * r_high - high * r_low) / denom;
+            let r_mid = eval_residual(mid);
+            result = mid;
+
+            if r_mid.abs() < 1e-3 {
+                break;
+            }
+
+            if r_low * r_mid > 0.0 {
                 low = mid;
+                r_low = r_mid;
+                if side == -1 {
+                    r_high *= 0.5;
+                }
+                side = -1;
+            } else {
+                high = mid;
+                r_high = r_mid;
+                if side == 1 {
+                    r_low *= 0.5;
+                }
+                side = 1;
             }
         }
-        
-        0.5 * (low + high)
+
+        result
     }
 
     #[allow(non_snake_case)]
@@ -2215,59 +2295,56 @@ impl Solver {
     ) -> f32 {
         let psi = lift.max(1e-4);
         let c_int = c_interior.max(1e-2);
-        
+
+        let inv_c_int7 = 1.0 / {
+            let c2 = c_int * c_int;
+            let c4 = c2 * c2;
+            let c6 = c4 * c2;
+            c6 * c_int
+        };
+        let inv_c_res5 = {
+            let c2 = c_res * c_res;
+            let c4 = c2 * c2;
+            1.0 / (c4 * c_res)
+        };
+
         let eval_residual = |v_out: f32| -> f32 {
             let c_bc = 0.2 * (r_in - v_out);
             if c_bc <= 0.0 {
                 return 1e6; // Penalty for non-physical negative sound speeds
             }
-            
-            let p_bc = p_interior * (c_bc / c_int).powi(7);
-            
+
+            let c_bc2 = c_bc * c_bc;
+            let c_bc4 = c_bc2 * c_bc2;
+            let c_bc6 = c_bc4 * c_bc2;
+            let c_bc7 = c_bc6 * c_bc;
+            let p_bc = p_interior * c_bc7 * inv_c_int7;
+
             // Small hysteresis band avoids inflow/outflow branch chatter near atmospheric pressure.
             if p_bc >= P_ATM - 25.0 {
                 // Outflow: gas leaves pipe, expands into reservoir
-                let pr = (P_ATM / p_bc.max(1e-3)).max(0.0).min(1.0);
-                let phi = if pr <= 0.52828 {
-                    0.5787
-                } else {
-                    let poly = 0.174087330145 
-                             + pr * (1.845079102463 
-                             + pr * (-1.619439906917 
-                             + pr * (1.268381247447 
-                             + pr * (-0.593403052591 
-                             + pr * 0.120537101468))));
-                    (1.0 - pr).max(0.0).sqrt() * poly
-                };
+                let pr = (P_ATM / p_bc.max(1e-3)).clamp(0.0, 1.0);
+                let phi = Self::isentropic_phi(pr);
                 let target_v = psi * c_bc * phi;
                 v_out - target_v
             } else {
                 // Inflow: gas enters pipe from atmospheric reservoir
-                let pr = (p_bc / P_ATM).max(0.0).min(1.0);
-                let phi = if pr <= 0.52828 {
-                    0.5787
-                } else {
-                    let poly = 0.174087330145 
-                             + pr * (1.845079102463 
-                             + pr * (-1.619439906917 
-                             + pr * (1.268381247447 
-                             + pr * (-0.593403052591 
-                             + pr * 0.120537101468))));
-                    (1.0 - pr).max(0.0).sqrt() * poly
-                };
-                let rho_bc = RHO_ATM * (c_bc / c_res).powi(5);
+                let pr = (p_bc / P_ATM).clamp(0.0, 1.0);
+                let phi = Self::isentropic_phi(pr);
+                let c_bc5 = c_bc4 * c_bc;
+                let rho_bc = RHO_ATM * c_bc5 * inv_c_res5;
                 let g = psi * RHO_ATM * c_res * phi;
                 let target_v = -g / rho_bc.max(1e-3);
                 v_out - target_v
             }
         };
-        
+
         let mut low = -c_res - 200.0;
         let mut high = (r_in - 1e-3).max(low + 10.0);
-        
+
         let mut r_low = eval_residual(low);
         let mut r_high = eval_residual(high);
-        
+
         if r_low * r_high > 0.0 {
             if r_low > 0.0 {
                 for _ in 0..15 {
@@ -2291,23 +2368,45 @@ impl Solver {
                 }
             }
         }
-        
-        for _ in 0..25 {
-            let mid = 0.5 * (low + high);
-            let res = eval_residual(mid);
-            if res > 0.0 {
-                high = mid;
-            } else {
+
+        let mut result = 0.5 * (low + high);
+        let mut side = 0i32;
+        for _ in 0..12 {
+            let denom = r_high - r_low;
+            if denom.abs() < 1e-6 {
+                break;
+            }
+            let mid = (low * r_high - high * r_low) / denom;
+            let r_mid = eval_residual(mid);
+            result = mid;
+
+            if r_mid.abs() < 1e-3 {
+                break;
+            }
+
+            if r_low * r_mid > 0.0 {
                 low = mid;
+                r_low = r_mid;
+                if side == -1 {
+                    r_high *= 0.5;
+                }
+                side = -1;
+            } else {
+                high = mid;
+                r_high = r_mid;
+                if side == 1 {
+                    r_low *= 0.5;
+                }
+                side = 1;
             }
         }
-        
-        0.5 * (low + high)
+
+        result
     }
 
 
 
-    /// Internal FVM scheme solver
+/// Internal FVM scheme solver
     fn compute_rhs_internal(
         limiter: LimiterType,
         friction: f32,
@@ -2323,60 +2422,97 @@ impl Solver {
 
         // 1. Primitive variables
         for i in 0..=(num_cells + 1) {
-            tube.w[i] = conserved_to_primitive(&state[i], gamma);
+            unsafe {
+                *tube.w.get_unchecked_mut(i) = conserved_to_primitive(state.get_unchecked(i), gamma);
+            }
         }
 
         // 2. MUSCL slopes
-        for i in 1..=num_cells {
-            let dw_l = [tube.w[i][0] - tube.w[i - 1][0], tube.w[i][1] - tube.w[i - 1][1], tube.w[i][2] - tube.w[i - 1][2]];
-            let dw_r = [tube.w[i + 1][0] - tube.w[i][0], tube.w[i + 1][1] - tube.w[i][1], tube.w[i + 1][2] - tube.w[i][2]];
-
-            for k in 0..3 {
-                tube.slopes[i][k] = match limiter {
-                    LimiterType::None => 0.0,
-                    LimiterType::Minmod => limit_slope_minmod(dw_l[k], dw_r[k]),
-                    LimiterType::Superbee => limit_slope_superbee(dw_l[k], dw_r[k]),
-                    LimiterType::MC => limit_slope_mc(dw_l[k], dw_r[k]),
-                    LimiterType::VanLeer => limit_slope_vanleer(dw_l[k], dw_r[k]),
-                };
+        unsafe {
+            match limiter {
+                LimiterType::None => {
+                    for i in 1..=num_cells {
+                        *tube.slopes.get_unchecked_mut(i) = [0.0; 3];
+                    }
+                }
+                LimiterType::Minmod => {
+                    for i in 1..=num_cells {
+                        for k in 0..3 {
+                            let dw_l = tube.w.get_unchecked(i)[k] - tube.w.get_unchecked(i - 1)[k];
+                            let dw_r = tube.w.get_unchecked(i + 1)[k] - tube.w.get_unchecked(i)[k];
+                            tube.slopes.get_unchecked_mut(i)[k] = limit_slope_minmod(dw_l, dw_r);
+                        }
+                    }
+                }
+                LimiterType::Superbee => {
+                    for i in 1..=num_cells {
+                        for k in 0..3 {
+                            let dw_l = tube.w.get_unchecked(i)[k] - tube.w.get_unchecked(i - 1)[k];
+                            let dw_r = tube.w.get_unchecked(i + 1)[k] - tube.w.get_unchecked(i)[k];
+                            tube.slopes.get_unchecked_mut(i)[k] = limit_slope_superbee(dw_l, dw_r);
+                        }
+                    }
+                }
+                LimiterType::MC => {
+                    for i in 1..=num_cells {
+                        for k in 0..3 {
+                            let dw_l = tube.w.get_unchecked(i)[k] - tube.w.get_unchecked(i - 1)[k];
+                            let dw_r = tube.w.get_unchecked(i + 1)[k] - tube.w.get_unchecked(i)[k];
+                            tube.slopes.get_unchecked_mut(i)[k] = limit_slope_mc(dw_l, dw_r);
+                        }
+                    }
+                }
+                LimiterType::VanLeer => {
+                    for i in 1..=num_cells {
+                        for k in 0..3 {
+                            let dw_l = tube.w.get_unchecked(i)[k] - tube.w.get_unchecked(i - 1)[k];
+                            let dw_r = tube.w.get_unchecked(i + 1)[k] - tube.w.get_unchecked(i)[k];
+                            tube.slopes.get_unchecked_mut(i)[k] = limit_slope_vanleer(dw_l, dw_r);
+                        }
+                    }
+                }
             }
         }
 
         // 3. Interface Fluxes
         for j in 0..=num_cells {
-            let mut w_l = tube.w[j];
-            if j >= 1 {
-                for k in 0..3 {
-                    w_l[k] += 0.5 * tube.slopes[j][k];
+            unsafe {
+                let mut w_l = *tube.w.get_unchecked(j);
+                if j >= 1 {
+                    let slope_l = tube.slopes.get_unchecked(j);
+                    for k in 0..3 {
+                        w_l[k] += 0.5 * slope_l[k];
+                    }
                 }
-            }
-            w_l[0] = w_l[0].max(1e-4);
-            w_l[2] = w_l[2].max(1e-2);
+                w_l[0] = w_l[0].max(1e-4);
+                w_l[2] = w_l[2].max(1e-2);
 
-            let mut w_r = tube.w[j + 1];
-            if j + 1 <= num_cells {
-                for k in 0..3 {
-                    w_r[k] -= 0.5 * tube.slopes[j + 1][k];
+                let mut w_r = *tube.w.get_unchecked(j + 1);
+                if j + 1 <= num_cells {
+                    let slope_r = tube.slopes.get_unchecked(j + 1);
+                    for k in 0..3 {
+                        w_r[k] -= 0.5 * slope_r[k];
+                    }
                 }
+                w_r[0] = w_r[0].max(1e-4);
+                w_r[2] = w_r[2].max(1e-2);
+
+                let u_l = primitive_to_conserved(&w_l, gamma);
+                let u_r = primitive_to_conserved(&w_r, gamma);
+
+                let flux_l = euler_flux(&u_l, w_l[2]);
+                let flux_r = euler_flux(&u_r, w_r[2]);
+
+                let a_l = (gamma * w_l[2] / w_l[0]).sqrt();
+                let a_r = (gamma * w_r[2] / w_r[0]).sqrt();
+                let max_wave_speed = (w_l[1].abs() + a_l).max(w_r[1].abs() + a_r);
+
+                let mut interface_flux = [0.0; 3];
+                for k in 0..3 {
+                    interface_flux[k] = 0.5 * (flux_l[k] + flux_r[k]) - 0.5 * max_wave_speed * (u_r[k] - u_l[k]);
+                }
+                *tube.fluxes.get_unchecked_mut(j) = interface_flux;
             }
-            w_r[0] = w_r[0].max(1e-4);
-            w_r[2] = w_r[2].max(1e-2);
-
-            let u_l = primitive_to_conserved(&w_l, gamma);
-            let u_r = primitive_to_conserved(&w_r, gamma);
-
-            let flux_l = euler_flux(&u_l, w_l[2]);
-            let flux_r = euler_flux(&u_r, w_r[2]);
-
-            let a_l = (gamma * w_l[2] / w_l[0]).sqrt();
-            let a_r = (gamma * w_r[2] / w_r[0]).sqrt();
-            let max_wave_speed = (w_l[1].abs() + a_l).max(w_r[1].abs() + a_r);
-
-            let mut interface_flux = [0.0; 3];
-            for k in 0..3 {
-                interface_flux[k] = 0.5 * (flux_l[k] + flux_r[k]) - 0.5 * max_wave_speed * (u_r[k] - u_l[k]);
-            }
-            tube.fluxes[j] = interface_flux;
         }
 
         // Save boundary interface fluxes
@@ -2387,79 +2523,93 @@ impl Solver {
         let idx = 1.0 / dx;
 
         for i in 1..=num_cells {
-            tube.rhs[i][0] = -idx * (tube.fluxes[i][0] - tube.fluxes[i - 1][0]);
-            tube.rhs[i][1] = -idx * (tube.fluxes[i][1] - tube.fluxes[i - 1][1]);
-            tube.rhs[i][2] = -idx * (tube.fluxes[i][2] - tube.fluxes[i - 1][2]);
+            unsafe {
+                let flux_i = *tube.fluxes.get_unchecked(i);
+                let flux_im1 = *tube.fluxes.get_unchecked(i - 1);
+                let rhs_i = tube.rhs.get_unchecked_mut(i);
+                rhs_i[0] = -idx * (flux_i[0] - flux_im1[0]);
+                rhs_i[1] = -idx * (flux_i[1] - flux_im1[1]);
+                rhs_i[2] = -idx * (flux_i[2] - flux_im1[2]);
 
-            // Variable cross-sectional area source term:
-            // S_A = - dA/dx * 1/A * [rho*v, rho*v^2, (E + P)*v]
-            let a = tube.area[i];
-            let dadx = tube.dadx[i];
-            
-            if a > 1e-6 && dadx.abs() > 1e-6 {
-                let rho = state[i][0];
-                let v = state[i][1] / rho.max(1e-5);
-                let p = tube.w[i][2];
-                let e = state[i][2];
+                // Variable cross-sectional area source term:
+                // S_A = - dA/dx * 1/A * [rho*v, rho*v^2, (E + P)*v]
+                let a = *tube.area.get_unchecked(i);
+                let dadx = *tube.dadx.get_unchecked(i);
 
-                let s_area_mass = -(dadx / a) * rho * v;
-                let s_area_momentum = -(dadx / a) * rho * v * v;
-                let s_area_energy = -(dadx / a) * (e + p) * v;
+                if a > 1e-6 && dadx.abs() > 1e-6 {
+                    let s = state.get_unchecked(i);
+                    let rho = s[0];
+                    let v = s[1] / rho.max(1e-5);
+                    let p = tube.w.get_unchecked(i)[2];
+                    let e = s[2];
 
-                tube.rhs[i][0] += s_area_mass;
-                tube.rhs[i][1] += s_area_momentum;
-                tube.rhs[i][2] += s_area_energy;
-            }
+                    let s_area_mass = -(dadx / a) * rho * v;
+                    let s_area_momentum = -(dadx / a) * rho * v * v;
+                    let s_area_energy = -(dadx / a) * (e + p) * v;
 
-            // Friction source term
-            if friction > 0.0 {
-                let rho = state[i][0];
-                let v = state[i][1] / rho.max(1e-5);
-                
-                // Physical Darcy-Weisbach quadratic wall friction
-                // D = 2 * radius = 2 * sqrt(Area / PI)
-                let radius = (a / std::f32::consts::PI).sqrt().max(0.001);
-                let d = 2.0 * radius;
-                let f_factor = friction / (2.0 * d);
-                let s_momentum = -f_factor * rho * v * v.abs();
-                let s_energy = -f_factor * rho * v * v * v.abs();
-                
-                tube.rhs[i][1] += s_momentum;
-                tube.rhs[i][2] += s_energy;
-            }
+                    let rhs_i = tube.rhs.get_unchecked_mut(i);
+                    rhs_i[0] += s_area_mass;
+                    rhs_i[1] += s_area_momentum;
+                    rhs_i[2] += s_area_energy;
+                }
 
-            // Wall heat transfer: relaxes gas temperature toward wall temperature (T_ATM)
-            // This provides the missing energy sink — after a pulse passes, elevated
-            // pressure/temperature gradually returns to atmospheric equilibrium.
-            if heat_transfer > 0.0 {
-                let rho = state[i][0].max(1e-5);
-                let v = state[i][1] / rho;
-                let ke = 0.5 * rho * v * v;
-                let internal_e = (state[i][2] - ke).max(1e-4);
-                let p = internal_e * (gamma - 1.0);
-                let t_gas = p / (rho * R_AIR);
-                let dt_wall = t_gas - T_ATM;
+                // Friction source term
+                if friction > 0.0 {
+                    let s = state.get_unchecked(i);
+                    let rho = s[0];
+                    let v = s[1] / rho.max(1e-5);
 
-                // Energy loss rate scaled by surface-to-volume ratio (2/radius for circular tube)
-                let radius = (tube.area[i] / std::f32::consts::PI).sqrt().max(0.001);
-                let s_energy_heat = -heat_transfer * rho * R_AIR * dt_wall * (2.0 / radius);
+                    // Physical Darcy-Weisbach quadratic wall friction
+                    // D = 2 * radius = 2 * sqrt(Area / PI)
+                    let radius = (a / std::f32::consts::PI).sqrt().max(0.001);
+                    let d = 2.0 * radius;
+                    let f_factor = friction / (2.0 * d);
+                    let s_momentum = -f_factor * rho * v * v.abs();
+                    let s_energy = -f_factor * rho * v * v * v.abs();
 
-                tube.rhs[i][2] += s_energy_heat;
+                    let rhs_i = tube.rhs.get_unchecked_mut(i);
+                    rhs_i[1] += s_momentum;
+                    rhs_i[2] += s_energy;
+                }
+
+                // Wall heat transfer: relaxes gas temperature toward wall temperature (T_ATM)
+                if heat_transfer > 0.0 {
+                    let s = state.get_unchecked(i);
+                    let rho = s[0].max(1e-5);
+                    let v = s[1] / rho;
+                    let ke = 0.5 * rho * v * v;
+                    let internal_e = (s[2] - ke).max(1e-4);
+                    let p = internal_e * (gamma - 1.0);
+                    let t_gas = p / (rho * R_AIR);
+                    let dt_wall = t_gas - T_ATM;
+
+                    let radius = (a / std::f32::consts::PI).sqrt().max(0.001);
+                    let s_energy_heat = -heat_transfer * rho * R_AIR * dt_wall * (2.0 / radius);
+
+                    tube.rhs.get_unchecked_mut(i)[2] += s_energy_heat;
+                }
             }
         }
 
         // Species upwind advection
         let species_state = if use_temp { &tube.species_temp } else { &tube.species };
         for i in 1..=num_cells {
-            let rho = state[i][0].max(1e-5);
-            let v = state[i][1] / rho;
-            for k in 0..4 {
-                let dy_dx = if v >= 0.0 {
-                    (species_state[i][k] - species_state[i - 1][k]) / dx
-                } else {
-                    (species_state[i + 1][k] - species_state[i][k]) / dx
-                };
-                tube.species_rhs[i][k] = -v * dy_dx;
+            unsafe {
+                let s = state.get_unchecked(i);
+                let rho = s[0].max(1e-5);
+                let v = s[1] / rho;
+                let sp_i = species_state.get_unchecked(i);
+                let sp_im1 = species_state.get_unchecked(i - 1);
+                let sp_ip1 = species_state.get_unchecked(i + 1);
+                let rhs_i = tube.species_rhs.get_unchecked_mut(i);
+                for k in 0..4 {
+                    let dy_dx = if v >= 0.0 {
+                        (sp_i[k] - sp_im1[k]) / dx
+                    } else {
+                        (sp_ip1[k] - sp_i[k]) / dx
+                    };
+                    rhs_i[k] = -v * dy_dx;
+                }
             }
         }
 
@@ -2525,6 +2675,7 @@ pub fn bezier_length(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]) -> 
 
 // ------------------ Conversions ------------------
 
+#[inline(always)]
 pub fn primitive_to_conserved(w: &[f32; 3], gamma: f32) -> [f32; 3] {
     let rho = w[0];
     let v = w[1];
@@ -2537,6 +2688,7 @@ pub fn primitive_to_conserved(w: &[f32; 3], gamma: f32) -> [f32; 3] {
     [rho, rho * v, energy]
 }
 
+#[inline(always)]
 pub fn conserved_to_primitive(u: &[f32; 3], gamma: f32) -> [f32; 3] {
     let rho = u[0].max(1e-4);
     let momentum = u[1];
@@ -2550,6 +2702,7 @@ pub fn conserved_to_primitive(u: &[f32; 3], gamma: f32) -> [f32; 3] {
     [rho, v, p]
 }
 
+#[inline(always)]
 pub fn euler_flux(u: &[f32; 3], p: f32) -> [f32; 3] {
     let rho = u[0];
     let momentum = u[1];
@@ -2563,7 +2716,6 @@ pub fn euler_flux(u: &[f32; 3], p: f32) -> [f32; 3] {
         (energy + p) * v,
     ]
 }
-
 // ------------------ Slopes ------------------
 
 fn limit_slope_minmod(a: f32, b: f32) -> f32 {
@@ -2985,4 +3137,3 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
-
