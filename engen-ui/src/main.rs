@@ -111,6 +111,12 @@ struct SharedState {
     // Starter motor state
     pub starter_engaged: bool,
     pub starter_timer: f32,    // Remaining starter duration in seconds
+
+    // ECU telemetry
+    pub ecu_map_pa: f32,
+    pub ecu_iac_lift: f32,
+    pub ecu_is_cranking: bool,
+    pub ecu_rev_limiter_active: bool,
 }
 
 fn spawn_solver_thread(
@@ -178,42 +184,25 @@ fn spawn_solver_thread(
                     solver.heat_transfer = state.heat_transfer;
                     solver.reflection_filter = reflection_filter;
                     solver.ignition_on = state.ignition_on;
-                    solver.ignition_timing_deg = state.ignition_timing_deg;
-                    solver.target_afr = state.target_afr;
+                    if solver.crankshaft.is_none() {
+                        solver.ignition_timing_deg = state.ignition_timing_deg;
+                        solver.target_afr = state.target_afr;
+                    }
                     
                     // Legacy Spin Up Trigger (kept for debug button)
                     if state.trigger_spin {
                         state.trigger_spin = false;
                         if let Some(ref mut crank) = solver.crankshaft {
-                            crank.omega = (state.spin_rpm * 2.0 * std::f32::consts::PI) / 60.0;
+                            crank.omega = ((state.spin_rpm as f64 * 2.0 * std::f64::consts::PI) / 60.0) as f32;
+                            solver.ecu.is_cranking = false; // direct running mode
                         }
                     }
                     
-                    // Starter motor: apply sustained cranking torque
-                    if let Some(ref mut crank) = solver.crankshaft {
-                        if state.starter_engaged && state.starter_timer > 0.0 {
-                            crank.starter_torque = 90.0; // N*m at the crank - upped again now that Coulomb friction/compression resistance is higher
-                            
-                            // Auto-disengage once engine catches (sustained above 600 RPM)
-                            let rpm = (crank.omega * 60.0) / (2.0 * std::f32::consts::PI);
-                            if rpm > 600.0 {
-                                state.starter_engaged = false;
-                                state.starter_timer = 0.0;
-                                crank.starter_torque = 0.0;
-                            }
-                        } else {
-                            crank.starter_torque = 0.0;
-                            if state.starter_engaged {
-                                state.starter_engaged = false; // timer ran out
-                            }
-                        }
-                    }
+                    // Starter motor: apply dynamic cranking torque controlled by solver/ecu
+                    solver.starter_active = state.starter_engaged && state.starter_timer > 0.0;
                     
-                    // Throttle mapping with idle air bypass (minimum 3% opening)
-                    if solver.crankshaft.is_some() && !solver.tubes.is_empty() {
-                        let lift = state.throttle.max(0.004); // idle bypass - tightened from 0.03, which was saturating cylinder fill at idle dwell times
-                        solver.tubes[0].left_bc = BoundaryType::Valve { lift };
-                    }
+                    // Throttle mapping
+                    solver.throttle_input = state.throttle;
                     
                     // Sync engine mechanical parameters
                     if let Some(ref mut crank) = solver.crankshaft {
@@ -296,6 +285,18 @@ fn spawn_solver_thread(
                     state.ignition_on = solver.ignition_on;
                     state.ignition_timing_deg = solver.ignition_timing_deg;
                     state.target_afr = solver.target_afr;
+                    
+                    state.ecu_map_pa = solver.ecu.map_pa;
+                    state.ecu_iac_lift = solver.ecu.iac_lift;
+                    state.ecu_is_cranking = solver.ecu.is_cranking;
+                    state.ecu_rev_limiter_active = solver.ecu.rev_limiter_active;
+                    
+                    // Sync starter disengagement
+                    if !solver.starter_active && state.starter_engaged {
+                        state.starter_engaged = false;
+                        state.starter_timer = 0.0;
+                    }
+                    
                     state.cyl_pressure_history.clear();
                 }
                 force_ui_update = true;
@@ -404,6 +405,19 @@ fn spawn_solver_thread(
                         // Decrement starter timer by simulated time elapsed
                         if state.starter_engaged && state.starter_timer > 0.0 {
                             state.starter_timer -= steps_run as f32 * sim_dt;
+                        }
+
+                        state.ecu_map_pa = solver.ecu.map_pa;
+                        state.ecu_iac_lift = solver.ecu.iac_lift;
+                        state.ecu_is_cranking = solver.ecu.is_cranking;
+                        state.ecu_rev_limiter_active = solver.ecu.rev_limiter_active;
+                        state.ignition_timing_deg = solver.ignition_timing_deg;
+                        state.target_afr = solver.target_afr;
+
+                        // Sync starter disengagement
+                        if !solver.starter_active && state.starter_engaged {
+                            state.starter_engaged = false;
+                            state.starter_timer = 0.0;
                         }
                         
                         if let Some(ref crank) = solver.crankshaft {
@@ -615,9 +629,15 @@ impl eframe::App for EngenApp {
             state.engine_friction = self.engine_friction_input;
             state.spin_rpm = self.spin_rpm_input;
             state.ignition_on = self.ignition_on_input;
-            state.ignition_timing_deg = self.ignition_timing_deg_input;
-            state.target_afr = self.target_afr_input;
             state.audio_on = self.audio_on_input;
+
+            if state.has_engine {
+                self.ignition_timing_deg_input = state.ignition_timing_deg;
+                self.target_afr_input = state.target_afr;
+            } else {
+                state.ignition_timing_deg = self.ignition_timing_deg_input;
+                state.target_afr = self.target_afr_input;
+            }
             
             (
                 state.tubes.clone(),
@@ -704,13 +724,58 @@ impl eframe::App for EngenApp {
                             ui.checkbox(&mut self.audio_on_input, "Audio Output");
                         });
 
-                        ui.add(egui::Slider::new(&mut self.ignition_timing_deg_input, 0.0..=45.0).text("Ignition Timing").suffix("° BTDC"));
-                        
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Slider::new(&mut self.target_afr_input, 9.0..=20.0).text("Target AFR"));
-                            let lambda = self.target_afr_input / 14.7;
-                            ui.label(format!("(λ={:.2})", lambda));
-                        });
+                        if has_engine {
+                            ui.horizontal(|ui| {
+                                ui.label("Ignition Timing:");
+                                ui.label(format!("{:.1}° BTDC (ECU Map)", self.ignition_timing_deg_input as f64));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Target AFR:");
+                                ui.label(format!("{:.1} (λ={:.2}) (ECU Map)", self.target_afr_input as f64, (self.target_afr_input / 14.7) as f64));
+                            });
+                        } else {
+                            ui.add(egui::Slider::new(&mut self.ignition_timing_deg_input, 0.0..=45.0).text("Ignition Timing").suffix("° BTDC"));
+                            
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Slider::new(&mut self.target_afr_input, 9.0..=20.0).text("Target AFR"));
+                                let lambda = self.target_afr_input / 14.7;
+                                ui.label(format!("(λ={:.2})", lambda as f64));
+                            });
+                        }
+
+                        let (ecu_map_pa, ecu_iac_lift, ecu_is_cranking, ecu_rev_limiter_active) = {
+                            if let Ok(state) = self.shared_state.lock() {
+                                (state.ecu_map_pa, state.ecu_iac_lift, state.ecu_is_cranking, state.ecu_rev_limiter_active)
+                            } else {
+                                (101325.0, 0.0, true, false)
+                            }
+                        };
+
+                        if has_engine {
+                            ui.add_space(5.0);
+                            ui.separator();
+                            ui.label(egui::RichText::new("ECU Telemetry").strong());
+                            
+                            let mode_str = if ecu_is_cranking { "Cranking" } else { "Running" };
+                            ui.horizontal(|ui| {
+                                ui.label("ECU Mode:");
+                                ui.label(egui::RichText::new(mode_str).color(if ecu_is_cranking { egui::Color32::YELLOW } else { egui::Color32::GREEN }));
+                            });
+                            
+                            ui.horizontal(|ui| {
+                                ui.label("MAP (Load):");
+                                ui.label(format!("{:.1} kPa", (ecu_map_pa / 1000.0) as f64));
+                            });
+                            
+                            ui.horizontal(|ui| {
+                                ui.label("IAC Valve Lift:");
+                                ui.label(format!("{:.1}%", (ecu_iac_lift * 100.0 / 0.015) as f64));
+                            });
+
+                            if ecu_rev_limiter_active {
+                                ui.colored_label(egui::Color32::RED, "⚠️ REV LIMITER ACTIVE");
+                            }
+                        }
 
                         ui.add_space(5.0);
 
@@ -847,7 +912,7 @@ impl eframe::App for EngenApp {
                             });
                     });
                     
-                    ui.add(egui::Slider::new(&mut self.friction_input, 0.0..=50.0).text("Wall Friction"));
+                    ui.add(egui::Slider::new(&mut self.friction_input, 0.0..=0.2).text("Wall Friction"));
                     ui.add(egui::Slider::new(&mut self.heat_transfer_input, 0.0..=200.0).text("Wall Heat Transfer"));
                     ui.add(egui::Slider::new(&mut self.volume_input, 0.0..=1.0).text("Audio Volume"));
                     ui.add(egui::Slider::new(&mut self.reflection_input, 0.5..=1.0).text("Reflection Filter"));
@@ -1654,8 +1719,8 @@ fn main() -> eframe::Result<()> {
         junctions: Vec::new(),
         time: 0.0,
         limiter: LimiterType::VanLeer,
-        friction: 15.0,
-        heat_transfer: 2.0,
+        friction: 0.025,
+        heat_transfer: 30.0,
         speed_multiplier: 1.0,
         inject_pulse: false,
         pulse_amplitude: 20000.0,
@@ -1676,12 +1741,12 @@ fn main() -> eframe::Result<()> {
         cylinder_pressure: P_ATM,
         cylinder_volume: 0.0,
         cyl_pressure_history: Vec::new(),
-        engine_bore: 0.08,
-        engine_stroke: 0.08,
-        engine_conrod: 0.16,
-        engine_compression_ratio: 9.0,
-        engine_inertia: 0.08,
-        engine_friction: 0.12,
+        engine_bore: 0.052,
+        engine_stroke: 0.036,
+        engine_conrod: 0.072,
+        engine_compression_ratio: 10.0,
+        engine_inertia: 0.01,
+        engine_friction: 0.001,
         spin_rpm: 1200.0,
         trigger_spin: false,
         throttle: 1.0,
@@ -1691,6 +1756,10 @@ fn main() -> eframe::Result<()> {
         audio_on: true,
         starter_engaged: false,
         starter_timer: 0.0,
+        ecu_map_pa: 101325.0,
+        ecu_iac_lift: 0.0,
+        ecu_is_cranking: true,
+        ecu_rev_limiter_active: false,
     }));
     
     let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state), Arc::clone(&audio_buffer), Arc::clone(&filter_params));

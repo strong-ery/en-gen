@@ -1,6 +1,7 @@
 use std::fmt;
 use crate::mechanical::{Crankshaft, get_valve_lift, piston_dy_dtheta, ValveType};
 use crate::combustion::{Cylinder, CylinderConnection};
+use crate::ecu::Ecu;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimiterType {
@@ -370,6 +371,9 @@ pub struct Solver {
     pub ignition_on: bool,
     pub ignition_timing_deg: f32,
     pub target_afr: f32,
+    pub throttle_input: f32,
+    pub starter_active: bool,
+    pub ecu: Ecu,
 }
 
 impl Solver {
@@ -405,6 +409,9 @@ impl Solver {
             ignition_on: false,
             ignition_timing_deg: 15.0,
             target_afr: 14.7,
+            throttle_input: 1.0,
+            starter_active: false,
+            ecu: Ecu::new(),
         }
     }
 
@@ -494,6 +501,9 @@ impl Solver {
             ignition_on: false,
             ignition_timing_deg: 15.0,
             target_afr: 14.7,
+            throttle_input: 1.0,
+            starter_active: false,
+            ecu: Ecu::new(),
         }
     }
 
@@ -512,7 +522,7 @@ impl Solver {
             0.02,
             RadiusProfile::Linear,
             BoundaryType::Valve { lift: 1.0 }, // Throttle valve
-            BoundaryType::Closed,              // connected to intake valve
+            BoundaryType::Valve { lift: 0.0 }, // connected to intake valve
         );
         
         // Exhaust Runner (cylinder port -> Atmosphere outlet)
@@ -524,11 +534,11 @@ impl Solver {
             [0.48, 0.35],
             [0.84, 0.35],
             [1.2, 0.35],
-            0.02,
-            0.02,
-            0.02,
-            RadiusProfile::Linear,
-            BoundaryType::Closed, // connected to exhaust valve
+            0.012, // r_start (12mm)
+            0.012, // r_end (12mm)
+            0.035, // r_mid (35mm muffler chamber)
+            RadiusProfile::ExpansionChamber,
+            BoundaryType::Valve { lift: 0.0 }, // connected to exhaust valve
             BoundaryType::Open,   // radiates sound pressure
         );
 
@@ -543,25 +553,25 @@ impl Solver {
             valve_type: ValveType::Exhaust,
         };
 
-        // Single cylinder with 80mm bore, 80mm stroke, 160mm conrod, 9.0 CR
+        // Single cylinder with 52mm bore, 36mm stroke, 72mm conrod, 10.0 CR (chainsaw specs)
         let cylinder = Cylinder::new(
             0,
-            0.08,  // bore (m)
-            0.08,  // stroke (m)
-            0.16,  // conrod (m)
-            9.0,   // CR
+            0.052, // bore (m)
+            0.036, // stroke (m)
+            0.072, // conrod (m)
+            10.0,  // CR
             vec![conn_in, conn_ex],
         );
 
-        // Crankshaft with 0.08 kg*m^2 inertia (realistic flywheel) and 0.12 viscous friction
-        let crankshaft = Crankshaft::new(0.08, 0.12);
+        // Crankshaft with 0.01 kg*m^2 inertia (suitable for small 4-stroke) and 0.001 viscous friction
+        let crankshaft = Crankshaft::new(0.01, 0.001);
 
         Self {
             tubes: vec![intake_tube, exhaust_tube],
             junctions: Vec::new(),
             limiter: LimiterType::VanLeer,
-            friction: 10.0,
-            heat_transfer: 2.0,
+            friction: 0.025,
+            heat_transfer: 30.0,
             t: 0.0,
             reflection_filter: 0.75,
             step_counter: 0,
@@ -571,6 +581,9 @@ impl Solver {
             ignition_on: true,
             ignition_timing_deg: 15.0,
             target_afr: 14.7,
+            throttle_input: 1.0,
+            starter_active: false,
+            ecu: Ecu::new(),
         }
     }
 
@@ -598,8 +611,8 @@ impl Solver {
         let gamma = 1.4;
         
         // 1. Calculate the maximum stable timestep based on CFL = 0.8
-        // Recalculate stable timestep every 16 steps or if first step
-        if self.step_counter % 16 == 0 || self.cached_dt_stable == 0.0 {
+        // Recalculate stable timestep on every step to capture transient shock waves (blowdown)
+        if true {
             let mut max_speed = 10.0f32;
             let mut min_dx = f32::MAX;
             
@@ -699,6 +712,29 @@ impl Solver {
         let gamma = 1.4;
         let num_tubes = self.tubes.len();
 
+        // 0. Update ECU State
+        if let Some(ref crank) = self.crankshaft {
+            let rpm = crank.omega * 60.0 / (2.0 * std::f32::consts::PI);
+            let map_pa = if !self.tubes.is_empty() {
+                let last_cell = self.tubes[0].num_cells;
+                let w = conserved_to_primitive(&self.tubes[0].u[last_cell], gamma);
+                w[2]
+            } else {
+                P_ATM
+            };
+            self.ecu.update(rpm, map_pa, self.throttle_input, dt);
+
+            // Sync public fields for interface
+            self.target_afr = self.ecu.target_afr;
+            self.ignition_timing_deg = self.ecu.ignition_timing_deg;
+
+            // Set the intake boundary valve lift
+            if !self.tubes.is_empty() {
+                let lift = (self.throttle_input + self.ecu.iac_lift).clamp(0.001, 1.0);
+                self.tubes[0].left_bc = BoundaryType::Valve { lift };
+            }
+        }
+
         // 1. Update Crankshaft and Piston Volumes
         if let Some(ref mut crank) = self.crankshaft {
             let theta_old = crank.theta;
@@ -710,6 +746,14 @@ impl Solver {
                 pressure_torque += force * dy_dtheta;
             }
             
+            // Set starter torque from ECU
+            let starter_torque = self.ecu.get_starter_torque(self.starter_active);
+            crank.starter_torque = starter_torque;
+            // If ECU is no longer cranking, automatically turn off starter active flag
+            if !self.ecu.is_cranking {
+                self.starter_active = false;
+            }
+
             // Advance crankshaft dynamics
             crank.step(pressure_torque, dt);
             let theta_new = crank.theta;
@@ -724,8 +768,8 @@ impl Solver {
 
             // Ignition check and combustion energy release (Wiebe Function Curve)
             for cyl in &mut self.cylinders {
-                if self.ignition_on {
-                    let spark_angle = (4.0 * std::f32::consts::PI - self.ignition_timing_deg.to_radians()).rem_euclid(4.0 * std::f32::consts::PI);
+                if self.ignition_on && !self.ecu.spark_cut {
+                    let spark_angle = (4.0 * std::f32::consts::PI - self.ecu.ignition_timing_deg.to_radians()).rem_euclid(4.0 * std::f32::consts::PI);
                     
                     // Check if spark_angle was crossed this step to trigger combustion
                     let diff_target = (spark_angle - theta_old).rem_euclid(4.0 * std::f32::consts::PI);
@@ -757,7 +801,9 @@ impl Solver {
                     let eta = 0.40; // combustion thermal efficiency (realistic)
                     let cv = R_AIR / (gamma - 1.0);
                     
-                    let m_fuel = cyl.mass / (self.target_afr + 1.0);
+                    // Speed-density predicted fuel mass
+                    let v_disp = cyl.piston_area * cyl.stroke;
+                    let m_fuel = self.ecu.get_fuel_mass(v_disp, 293.15);
                     let delta_u = d_xb * m_fuel * q_lhv * eta;
                     
                     cyl.energy += delta_u;
@@ -849,8 +895,17 @@ impl Solver {
                 }
             }
             
-            cyl.mass_temp = (cyl.mass + dt * dmass).max(1e-6);
-            cyl.energy_temp = (cyl.energy - cyl.p * cyl.delta_vol + dt * denergy).max(1e-4);
+            let v_new = cyl.volume;
+            let v_old = (v_new - cyl.delta_vol).max(1e-6);
+            let v_ratio = (v_old / v_new).powf(gamma - 1.0);
+            
+            let max_drain_mass = 0.5 * cyl.mass;
+            let mass_change = (dt * dmass).max(-max_drain_mass);
+            cyl.mass_temp = (cyl.mass + mass_change).max(1e-6);
+            
+            let max_drain_energy = 0.5 * cyl.energy;
+            let energy_change = (dt * denergy).max(-max_drain_energy);
+            cyl.energy_temp = (cyl.energy * v_ratio + energy_change).max(1e-4);
             cyl.update_thermodynamics_temp(gamma);
         }
 
@@ -950,8 +1005,17 @@ impl Solver {
                 }
             }
             
-            cyl.mass = (0.5 * cyl.mass + 0.5 * cyl.mass_temp + 0.5 * dt * dmass).max(1e-6);
-            cyl.energy = (0.5 * cyl.energy + 0.5 * cyl.energy_temp - 0.5 * cyl.p_temp * cyl.delta_vol + 0.5 * dt * denergy).max(1e-4);
+            let v_new = cyl.volume;
+            let v_old = (v_new - cyl.delta_vol).max(1e-6);
+            let v_ratio = (v_old / v_new).powf(gamma - 1.0);
+            
+            let max_drain_mass = 0.5 * cyl.mass;
+            let mass_change = (0.5 * dt * dmass).max(-max_drain_mass);
+            cyl.mass = (0.5 * cyl.mass + 0.5 * cyl.mass_temp + mass_change).max(1e-6);
+            
+            let max_drain_energy = 0.5 * cyl.energy;
+            let energy_change = (0.5 * dt * denergy).max(-max_drain_energy);
+            cyl.energy = (0.5 * cyl.energy * v_ratio + 0.5 * cyl.energy_temp + energy_change).max(1e-4);
             cyl.update_thermodynamics(gamma);
         }
 
@@ -1430,8 +1494,19 @@ impl Solver {
                             new_r_out = Some(r_wall);
                         } else {
                             let (ghost, r_out) = Self::open_left_ghost(w1, gamma, c_res, tube_filter, lift, tubes[k].left_last_r_out);
-                            w0 = ghost;
-                            new_r_out = Some(r_out);
+                            if lift < 0.04 {
+                                let w_wall = [w1[0], -w1[1], w1[2]];
+                                let alpha = (lift - 1e-4) / (0.04 - 1e-4);
+                                let alpha = alpha.clamp(0.0, 1.0);
+                                w0 = lerp_primitive(w_wall, ghost, alpha);
+                                
+                                let c1 = (gamma * w1[2] / w1[0]).sqrt();
+                                let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
+                                new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
+                            } else {
+                                w0 = ghost;
+                                new_r_out = Some(r_out);
+                            }
                         }
                     }
                 }
@@ -1473,8 +1548,19 @@ impl Solver {
                             new_r_out = Some(r_wall);
                         } else {
                             let (ghost, r_out) = Self::open_right_ghost(wm, gamma, c_res, tube_filter, lift, tubes[k].right_last_r_out);
-                            w_m1 = ghost;
-                            new_r_out = Some(r_out);
+                            if lift < 0.04 {
+                                let w_wall = [wm[0], -wm[1], wm[2]];
+                                let alpha = (lift - 1e-4) / (0.04 - 1e-4);
+                                let alpha = alpha.clamp(0.0, 1.0);
+                                w_m1 = lerp_primitive(w_wall, ghost, alpha);
+                                
+                                let cm = (gamma * wm[2] / wm[0]).sqrt();
+                                let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
+                                new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
+                            } else {
+                                w_m1 = ghost;
+                                new_r_out = Some(r_out);
+                            }
                         }
                     }
                 }
@@ -1724,8 +1810,13 @@ impl Solver {
                 let rho = state[i][0];
                 let v = state[i][1] / rho.max(1e-5);
                 
-                let s_momentum = -friction * rho * v;
-                let s_energy = -friction * rho * v * v;
+                // Physical Darcy-Weisbach quadratic wall friction
+                // D = 2 * radius = 2 * sqrt(Area / PI)
+                let radius = (a / std::f32::consts::PI).sqrt().max(0.001);
+                let d = 2.0 * radius;
+                let f_factor = friction / (2.0 * d);
+                let s_momentum = -f_factor * rho * v * v.abs();
+                let s_energy = -f_factor * rho * v * v * v.abs();
                 
                 tube.rhs[i][1] += s_momentum;
                 tube.rhs[i][2] += s_energy;
@@ -1928,7 +2019,7 @@ mod tests {
     #[test]
     fn test_open_open_quiescent_jones() {
         let mut solver = Solver::new_single_tube(RadiusProfile::Linear, BoundaryType::Open, BoundaryType::Open);
-        solver.friction = 15.0;
+        solver.friction = 0.02;
         solver.heat_transfer = 2.0;
 
         let sim_dt = 1.0 / 64000.0;
@@ -1958,7 +2049,7 @@ mod tests {
         
         // Set a high reflection filter and low friction to make stability harder
         solver.reflection_filter = 0.85;
-        solver.friction = 5.0;
+        solver.friction = 0.01;
         
         // Inject multiple strong pulses
         for _ in 0..5 {
@@ -2072,20 +2163,44 @@ mod tests {
 
     #[test]
     fn test_engine_combustion_run() {
-        let mut solver = Solver::new_single_cylinder();
-        solver.ignition_on = true;
+        // Run with throttle = 1.0 (WOT)
+        let mut solver_wot = Solver::new_single_cylinder();
+        solver_wot.ignition_on = true;
+        solver_wot.throttle_input = 1.0;
+        if let Some(ref mut crank) = solver_wot.crankshaft {
+            crank.omega = 890.0; // ~8500 RPM
+        }
         
-        if let Some(ref mut crank) = solver.crankshaft {
-            crank.omega = 250.0;
+        // Run with throttle = 0.0 (Idle/Closed throttle)
+        let mut solver_idle = Solver::new_single_cylinder();
+        solver_idle.ignition_on = true;
+        solver_idle.throttle_input = 0.0;
+        if let Some(ref mut crank) = solver_idle.crankshaft {
+            crank.omega = 890.0; // ~8500 RPM
         }
         
         let sim_dt = 1.0 / 64000.0;
         for _ in 0..64000 {
-            solver.step(sim_dt);
+            solver_wot.step(sim_dt);
+            solver_idle.step(sim_dt);
         }
         
-        let final_omega = solver.crankshaft.as_ref().unwrap().omega;
-        assert!(final_omega > 0.0);
+        let final_omega_wot = solver_wot.crankshaft.as_ref().unwrap().omega;
+        let last_cell_wot = solver_wot.tubes[0].num_cells;
+        let w_wot = conserved_to_primitive(&solver_wot.tubes[0].u[last_cell_wot], 1.4);
+        let final_map_wot = w_wot[2];
+
+        let final_omega_idle = solver_idle.crankshaft.as_ref().unwrap().omega;
+        let last_cell_idle = solver_idle.tubes[0].num_cells;
+        let w_idle = conserved_to_primitive(&solver_idle.tubes[0].u[last_cell_idle], 1.4);
+        let final_map_idle = w_idle[2];
+
+        println!("[TEST OUTPUT] WOT: final_omega = {:.2} ({:.0} RPM), final_map = {:.0} Pa", final_omega_wot, final_omega_wot * 60.0 / (2.0 * std::f32::consts::PI), final_map_wot);
+        println!("[TEST OUTPUT] IDLE: final_omega = {:.2} ({:.0} RPM), final_map = {:.0} Pa", final_omega_idle, final_omega_idle * 60.0 / (2.0 * std::f32::consts::PI), final_map_idle);
+        
+        // WOT should have significantly higher RPM and MAP than IDLE
+        assert!(final_omega_wot > final_omega_idle);
+        assert!(final_map_wot > final_map_idle);
     }
 }
 

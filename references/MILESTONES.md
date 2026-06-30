@@ -26,7 +26,7 @@ Single fixed-width tube, atmosphere BCs, pressure pulse injected at t=0. Live eg
 
 ---
 
-## Milestone 3 — Benson Valve Boundary Condition
+## Milestone 3 ✅ — Benson Valve Boundary Condition
 **Goal:** Replace the simple open/closed BC with a physically correct valve model.
 
 - Implement Benson valve model at tube endpoints
@@ -40,7 +40,7 @@ Single fixed-width tube, atmosphere BCs, pressure pulse injected at t=0. Live eg
 
 ---
 
-## Milestone 4 — Mechanical Simulation (Planer)
+## Milestone 4 ✅ — Mechanical Simulation (Planer)
 **Goal:** A crankshaft driving a piston, volume change only — no combustion yet.
 
 - Crankshaft with rotational inertia, single crank pin
@@ -55,7 +55,7 @@ Single fixed-width tube, atmosphere BCs, pressure pulse injected at t=0. Live eg
 
 ---
 
-## Milestone 5 — First Fire: Single-Cylinder Audio
+## Milestone 5 ✅ — First Fire: Single-Cylinder Audio
 **Goal:** The engine makes sound. This is the first time you hear EnGen.
 
 - Instantaneous combustion energy release at TDC (internal energy increment)

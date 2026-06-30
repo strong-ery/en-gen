@@ -15,7 +15,7 @@ impl Crankshaft {
             omega: 0.0,
             inertia: inertia.max(1e-4),
             friction_coeff,
-            coulomb_friction: 8.0, // Default: 8.0 N*m dry/pumping friction (rings, bearings, pumping losses)
+            coulomb_friction: 0.5, // Default: 0.5 N*m dry/pumping friction (rings, bearings, pumping losses)
                                    // Needs to be large enough relative to combustion torque that low
                                    // throttle can't sustain rotation against it - see crank.step() below.
             starter_torque: 0.0,   // No starter torque by default
@@ -52,8 +52,8 @@ impl Crankshaft {
             self.omega = 0.0;
         }
         
-        // Clamp RPM to avoid numerical runaway (max ~11,500 RPM = 1200 rad/s)
-        let max_omega = 1200.0;
+        // Clamp RPM to avoid numerical runaway (max ~14,320 RPM = 1500 rad/s)
+        let max_omega = 1500.0;
         if self.omega > max_omega {
             self.omega = max_omega;
         }
