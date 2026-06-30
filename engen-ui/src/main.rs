@@ -7,6 +7,7 @@ use engen_core::cfd::solver::{
     Solver, Tube, Junction, RadiusProfile, LimiterType, BoundaryType, TubeSide,
     P_ATM, RHO_ATM, bezier_point, bezier_length
 };
+use engen_core::mechanical::get_valve_lift;
 use engen_audio::AudioFilterParams;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,7 @@ enum PresetType {
     Taper,
     ExpansionChamber,
     YJunction,
+    SingleCylinder,
 }
 
 impl std::fmt::Display for PresetType {
@@ -31,6 +33,7 @@ impl std::fmt::Display for PresetType {
             PresetType::Taper => write!(f, "Tapered Tube"),
             PresetType::ExpansionChamber => write!(f, "Expansion Chamber"),
             PresetType::YJunction => write!(f, "Y-Junction Exhaust"),
+            PresetType::SingleCylinder => write!(f, "Single Cylinder Engine"),
         }
     }
 }
@@ -76,6 +79,33 @@ struct SharedState {
     // Audio filter cutoffs (Hz) - synced to AudioFilterParams
     lp_cutoff_hz: f32,
     hp_cutoff_hz: f32,
+
+    // Milestone 4 mechanical fields
+    pub has_engine: bool,
+    pub engine_rpm: f32,
+    pub engine_crank_angle: f32,
+    pub cylinder_pressure: f32,
+    pub cylinder_volume: f32,
+    
+    // Cyl pressure history for the PV/crank angle plot
+    pub cyl_pressure_history: Vec<[f32; 2]>, // [crank_angle_degrees, pressure_pa]
+    
+    // Engine parameters (editable)
+    pub engine_bore: f32,
+    pub engine_stroke: f32,
+    pub engine_conrod: f32,
+    pub engine_compression_ratio: f32,
+    pub engine_inertia: f32,
+    pub engine_friction: f32,
+    
+    // Control inputs
+    pub spin_rpm: f32,
+    pub trigger_spin: bool,
+    pub throttle: f32,
+    pub ignition_on: bool,
+    pub ignition_timing_deg: f32,
+    pub target_afr: f32,
+    pub audio_on: bool,
 }
 
 fn spawn_solver_thread(
@@ -113,6 +143,7 @@ fn spawn_solver_thread(
             let mut force_ui_update = false;
             let audio_volume;
             let reflection_filter;
+            let state_audio_on;
             
             {
                 if let Ok(mut state) = shared_state.lock() {
@@ -133,13 +164,51 @@ fn spawn_solver_thread(
                     
                     audio_volume = state.audio_volume;
                     reflection_filter = state.reflection_filter;
+                    state_audio_on = state.audio_on;
                     
                     // Sync runtime editable fields
                     solver.limiter = state.limiter;
                     solver.friction = state.friction;
                     solver.heat_transfer = state.heat_transfer;
                     solver.reflection_filter = reflection_filter;
+                    solver.ignition_on = state.ignition_on;
+                    solver.ignition_timing_deg = state.ignition_timing_deg;
+                    solver.target_afr = state.target_afr;
                     
+                    // Spin Up Trigger
+                    if state.trigger_spin {
+                        state.trigger_spin = false;
+                        if let Some(ref mut crank) = solver.crankshaft {
+                            crank.omega = (state.spin_rpm * 2.0 * std::f32::consts::PI) / 60.0;
+                        }
+                    }
+                    
+                    // Throttle mapping
+                    if solver.crankshaft.is_some() && !solver.tubes.is_empty() {
+                        solver.tubes[0].left_bc = BoundaryType::Valve { lift: state.throttle };
+                    }
+                    
+                    // Sync engine mechanical parameters
+                    if let Some(ref mut crank) = solver.crankshaft {
+                        crank.inertia = state.engine_inertia;
+                        crank.friction_coeff = state.engine_friction;
+                    }
+                    if let Some(cyl) = solver.cylinders.first_mut() {
+                        if (cyl.bore - state.engine_bore).abs() > 1e-4
+                            || (cyl.stroke - state.engine_stroke).abs() > 1e-4
+                            || (cyl.conrod_length - state.engine_conrod).abs() > 1e-4
+                            || (cyl.compression_ratio - state.engine_compression_ratio).abs() > 1e-4
+                        {
+                            cyl.update_geometry(
+                                state.engine_bore,
+                                state.engine_stroke,
+                                state.engine_conrod,
+                                state.engine_compression_ratio,
+                            );
+                            state.cyl_pressure_history.clear();
+                        }
+                    }
+
                     // Sync valve lifts dynamically without resetting
                     for (k, tube) in solver.tubes.iter_mut().enumerate() {
                         if k < state.tubes.len() {
@@ -173,11 +242,27 @@ fn spawn_solver_thread(
                     }
                     PresetType::ExpansionChamber => Solver::new_single_tube(RadiusProfile::ExpansionChamber, BoundaryType::Closed, BoundaryType::Closed),
                     PresetType::YJunction => Solver::new_y_junction(),
+                    PresetType::SingleCylinder => Solver::new_single_cylinder(),
                 };
                 if let Ok(mut state) = shared_state.lock() {
                     state.tubes = solver.tubes.clone();
                     state.junctions = solver.junctions.clone();
                     state.time = solver.t;
+                    
+                    if let Some(ref cyl) = solver.cylinders.first() {
+                        state.engine_bore = cyl.bore;
+                        state.engine_stroke = cyl.stroke;
+                        state.engine_conrod = cyl.conrod_length;
+                        state.engine_compression_ratio = cyl.compression_ratio;
+                    }
+                    if let Some(ref crank) = solver.crankshaft {
+                        state.engine_inertia = crank.inertia;
+                        state.engine_friction = crank.friction_coeff;
+                    }
+                    state.ignition_on = solver.ignition_on;
+                    state.ignition_timing_deg = solver.ignition_timing_deg;
+                    state.target_afr = solver.target_afr;
+                    state.cyl_pressure_history.clear();
                 }
                 force_ui_update = true;
             }
@@ -252,7 +337,11 @@ fn spawn_solver_thread(
                     
                     let scaled_jones = jones_val * 5.0e-2;
                     let scaled = scaled_jones * audio_volume;
-                    let audio_sample = scaled / (1.0 + scaled.abs());
+                    let audio_sample = if state_audio_on && !scaled.is_nan() && !scaled.is_infinite() {
+                        scaled / (1.0 + scaled.abs())
+                    } else {
+                        0.0
+                    };
                     local_audio_buf.push(audio_sample);
                     
                     local_jones_history.push(scaled_jones);
@@ -277,6 +366,25 @@ fn spawn_solver_thread(
                         state.junctions = solver.junctions.clone();
                         state.time = solver.t;
                         state.jones_history = local_jones_history.clone();
+                        
+                        if let Some(ref crank) = solver.crankshaft {
+                            state.has_engine = true;
+                            state.engine_rpm = (crank.omega * 60.0) / (2.0 * std::f32::consts::PI);
+                            state.engine_crank_angle = crank.theta;
+                            if let Some(cyl) = solver.cylinders.first() {
+                                state.cylinder_pressure = cyl.p;
+                                state.cylinder_volume = cyl.volume;
+                                
+                                let angle_deg = crank.theta.to_degrees();
+                                state.cyl_pressure_history.push([angle_deg, cyl.p]);
+                                if state.cyl_pressure_history.len() > 360 {
+                                    state.cyl_pressure_history.remove(0);
+                                }
+                            }
+                        } else {
+                            state.has_engine = false;
+                            state.cyl_pressure_history.clear();
+                        }
                     }
                     last_ui_update = now_ui;
                 }
@@ -287,10 +395,22 @@ fn spawn_solver_thread(
                         state.junctions = solver.junctions.clone();
                         state.time = solver.t;
                         state.jones_history = local_jones_history.clone();
+                        
+                        if let Some(ref crank) = solver.crankshaft {
+                            state.has_engine = true;
+                            state.engine_rpm = (crank.omega * 60.0) / (2.0 * std::f32::consts::PI);
+                            state.engine_crank_angle = crank.theta;
+                            if let Some(cyl) = solver.cylinders.first() {
+                                state.cylinder_pressure = cyl.p;
+                                state.cylinder_volume = cyl.volume;
+                            }
+                        } else {
+                            state.has_engine = false;
+                        }
                     }
                     last_ui_update = std::time::Instant::now();
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
             
             if steps_timer.elapsed().as_secs_f32() >= 1.0 {
@@ -301,8 +421,6 @@ fn spawn_solver_thread(
                 steps_this_second = 0;
                 steps_timer = std::time::Instant::now();
             }
-            
-            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     })
 }
@@ -330,14 +448,32 @@ struct EngenApp {
     
     lp_cutoff_input: f32,
     hp_cutoff_input: f32,
+
+    // Engine parameters inputs
+    engine_bore_input: f32,
+    engine_stroke_input: f32,
+    engine_conrod_input: f32,
+    engine_compression_ratio_input: f32,
+    engine_inertia_input: f32,
+    engine_friction_input: f32,
+    spin_rpm_input: f32,
+    throttle_input: f32,
+
+    ignition_on_input: bool,
+    ignition_timing_deg_input: f32,
+    target_afr_input: f32,
+    audio_on_input: bool,
 }
 
 impl EngenApp {
     fn new(shared_state: Arc<Mutex<SharedState>>, filter_params: Arc<Mutex<AudioFilterParams>>) -> Self {
-        let (limiter, friction, heat_transfer, vol, filter, lp_cutoff, hp_cutoff) = {
+        let (limiter, friction, heat_transfer, vol, filter, lp_cutoff, hp_cutoff, bore, stroke, conrod, cr, inertia, eng_fric, spin_rpm, throttle, ign, timing, afr, audio) = {
             let state = shared_state.lock().unwrap();
             (state.limiter, state.friction, state.heat_transfer, state.audio_volume, state.reflection_filter,
-             state.lp_cutoff_hz, state.hp_cutoff_hz)
+             state.lp_cutoff_hz, state.hp_cutoff_hz,
+             state.engine_bore, state.engine_stroke, state.engine_conrod, state.engine_compression_ratio,
+             state.engine_inertia, state.engine_friction, state.spin_rpm, state.throttle,
+             state.ignition_on, state.ignition_timing_deg, state.target_afr, state.audio_on)
         };
         
         let mut app = Self {
@@ -359,6 +495,20 @@ impl EngenApp {
             reflection_input: filter,
             lp_cutoff_input: lp_cutoff,
             hp_cutoff_input: hp_cutoff,
+            
+            engine_bore_input: bore,
+            engine_stroke_input: stroke,
+            engine_conrod_input: conrod,
+            engine_compression_ratio_input: cr,
+            engine_inertia_input: inertia,
+            engine_friction_input: eng_fric,
+            spin_rpm_input: spin_rpm,
+            throttle_input: throttle,
+
+            ignition_on_input: ign,
+            ignition_timing_deg_input: timing,
+            target_afr_input: afr,
+            audio_on_input: audio,
         };
         app.reseed_particles();
         app
@@ -389,7 +539,7 @@ impl eframe::App for EngenApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
         }
 
-        let (tubes, junctions, current_time, rtf, sps) = {
+        let (tubes, junctions, current_time, rtf, sps, has_engine, engine_rpm, crank_angle, cyl_p, cyl_v) = {
             let mut state = self.shared_state.lock().unwrap();
             
             // Sync control inputs to shared state config
@@ -400,12 +550,31 @@ impl eframe::App for EngenApp {
             state.audio_volume = self.volume_input;
             state.reflection_filter = self.reflection_input;
             
+            // Sync engine sliders from EngenApp to SharedState
+            state.throttle = self.throttle_input;
+            state.engine_bore = self.engine_bore_input;
+            state.engine_stroke = self.engine_stroke_input;
+            state.engine_conrod = self.engine_conrod_input;
+            state.engine_compression_ratio = self.engine_compression_ratio_input;
+            state.engine_inertia = self.engine_inertia_input;
+            state.engine_friction = self.engine_friction_input;
+            state.spin_rpm = self.spin_rpm_input;
+            state.ignition_on = self.ignition_on_input;
+            state.ignition_timing_deg = self.ignition_timing_deg_input;
+            state.target_afr = self.target_afr_input;
+            state.audio_on = self.audio_on_input;
+            
             (
                 state.tubes.clone(),
                 state.junctions.clone(),
                 state.time,
                 state.real_time_factor,
                 state.steps_per_second,
+                state.has_engine,
+                state.engine_rpm,
+                state.engine_crank_angle,
+                state.cylinder_pressure,
+                state.cylinder_volume,
             )
         };
         
@@ -414,7 +583,7 @@ impl eframe::App for EngenApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.heading("EnGen CFD Visualizer");
-                    ui.label(egui::RichText::new("Milestone 2: Y-Junctions & Geometry").weak());
+                    ui.label(egui::RichText::new("Milestone 4: Piston & Crankshaft Mechanics").weak());
                 });
                 
                 ui.add_space(10.0);
@@ -432,6 +601,7 @@ impl eframe::App for EngenApp {
                             ui.selectable_value(&mut self.preset_selection, PresetType::Taper, "Tapered Tube");
                             ui.selectable_value(&mut self.preset_selection, PresetType::ExpansionChamber, "Expansion Chamber");
                             ui.selectable_value(&mut self.preset_selection, PresetType::YJunction, "Y-Junction Exhaust");
+                            ui.selectable_value(&mut self.preset_selection, PresetType::SingleCylinder, "Single Cylinder Engine");
                         });
                     
                     if self.preset_selection != old_preset {
@@ -444,6 +614,85 @@ impl eframe::App for EngenApp {
                 });
                 
                 ui.add_space(10.0);
+
+                if has_engine {
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("Engine Diagnostics").strong());
+                        ui.horizontal(|ui| {
+                            ui.label("Engine Speed:");
+                            ui.label(egui::RichText::new(format!("{:.0} RPM", engine_rpm)).color(egui::Color32::LIGHT_GREEN));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Crank Angle:");
+                            ui.label(format!("{:.1}° BTDC", (crank_angle.to_degrees() % 360.0)));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Cylinder Pressure:");
+                            ui.label(format!("{:.1} kPa", cyl_p / 1000.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Cylinder Volume:");
+                            ui.label(format!("{:.1} cc", cyl_v * 1e6));
+                        });
+                    });
+                    ui.add_space(10.0);
+
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("Engine Controls").strong());
+                        ui.add(egui::Slider::new(&mut self.throttle_input, 0.0..=1.0).text("Throttle").suffix("x"));
+                        
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.ignition_on_input, "Ignition ON");
+                            ui.checkbox(&mut self.audio_on_input, "Audio Output");
+                        });
+
+                        ui.add(egui::Slider::new(&mut self.ignition_timing_deg_input, 0.0..=45.0).text("Ignition Timing").suffix("° BTDC"));
+                        
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Slider::new(&mut self.target_afr_input, 9.0..=20.0).text("Target AFR"));
+                            let lambda = self.target_afr_input / 14.7;
+                            ui.label(format!("(λ={:.2})", lambda));
+                        });
+
+                        ui.add_space(5.0);
+
+                        ui.horizontal(|ui| {
+                            if engine_rpm < 100.0 {
+                                if ui.button("⚡ Start Engine (Crank)").clicked() {
+                                    self.ignition_on_input = true;
+                                    if let Ok(mut state) = self.shared_state.lock() {
+                                        state.trigger_spin = true;
+                                        state.spin_rpm = 1000.0;
+                                    }
+                                }
+                            } else {
+                                if ui.button("🔌 Kill Engine (Stop)").clicked() {
+                                    self.ignition_on_input = false;
+                                }
+                            }
+                            
+                            // Spin up controls for debugging
+                            if ui.button("🌀 Spin (2500 RPM)").clicked() {
+                                if let Ok(mut state) = self.shared_state.lock() {
+                                    state.trigger_spin = true;
+                                    state.spin_rpm = 2500.0;
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(10.0);
+
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("Engine Geometry").strong());
+                        ui.add(egui::Slider::new(&mut self.engine_bore_input, 0.04..=0.15).text("Bore").suffix(" m"));
+                        ui.add(egui::Slider::new(&mut self.engine_stroke_input, 0.04..=0.15).text("Stroke").suffix(" m"));
+                        ui.add(egui::Slider::new(&mut self.engine_conrod_input, 0.10..=0.30).text("Conrod").suffix(" m"));
+                        ui.add(egui::Slider::new(&mut self.engine_compression_ratio_input, 4.0..=20.0).text("CR"));
+                        ui.add(egui::Slider::new(&mut self.engine_inertia_input, 0.005..=0.2).text("Inertia"));
+                        ui.add(egui::Slider::new(&mut self.engine_friction_input, 0.01..=0.5).text("Friction"));
+                    });
+                    ui.add_space(10.0);
+                }
 
                 // Simulation Stats
                 ui.group(|ui| {
@@ -494,20 +743,22 @@ impl eframe::App for EngenApp {
                 
                 ui.add_space(10.0);
                 
-                // Pulse Injection
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("Pulse Injection (Main Tube)").strong());
-                    ui.add(egui::Slider::new(&mut self.amplitude_input, 1000.0..=50000.0).text("Amplitude").suffix(" Pa"));
-                    ui.add(egui::Slider::new(&mut self.width_input, 0.02..=0.30).text("Width").suffix(" m"));
-                    if ui.button("💥 Inject Pressure Pulse").clicked() {
-                        let mut state = self.shared_state.lock().unwrap();
-                        state.pulse_amplitude = self.amplitude_input;
-                        state.pulse_width = self.width_input;
-                        state.inject_pulse = true;
-                    }
-                });
-                
-                ui.add_space(10.0);
+                if !has_engine {
+                    // Pulse Injection
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("Pulse Injection (Main Tube)").strong());
+                        ui.add(egui::Slider::new(&mut self.amplitude_input, 1000.0..=50000.0).text("Amplitude").suffix(" Pa"));
+                        ui.add(egui::Slider::new(&mut self.width_input, 0.02..=0.30).text("Width").suffix(" m"));
+                        if ui.button("💥 Inject Pressure Pulse").clicked() {
+                            let mut state = self.shared_state.lock().unwrap();
+                            state.pulse_amplitude = self.amplitude_input;
+                            state.pulse_width = self.width_input;
+                            state.inject_pulse = true;
+                        }
+                    });
+                    
+                    ui.add_space(10.0);
+                }
                 
                 // Solver Configuration
                 ui.group(|ui| {
@@ -819,6 +1070,39 @@ impl eframe::App for EngenApp {
                         plot_ui.hline(HLine::new(0.0).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
                         plot_ui.line(line);
                     });
+
+                    if has_engine {
+                        ui.add_space(5.0);
+                        ui.separator();
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("Cylinder Pressure vs. Crank Angle (PV/θ Curve)").strong());
+                        
+                        let cyl_history = {
+                            let state = self.shared_state.lock().unwrap();
+                            state.cyl_pressure_history.clone()
+                        };
+                        
+                        let points: PlotPoints = cyl_history
+                            .iter()
+                            .map(|&[angle, p]| [angle as f64, (p / 1000.0) as f64]) // Pa to kPa
+                            .collect();
+                        
+                        let line = Line::new(points).color(egui::Color32::from_rgb(50, 205, 50)).width(2.0);
+                        let plot = Plot::new("cylinder_pressure_plot")
+                            .height(120.0)
+                            .show_grid(true)
+                            .x_axis_label("Crank Angle (degrees)")
+                            .y_axis_label("Pressure (kPa)")
+                            .include_x(0.0)
+                            .include_x(720.0)
+                            .include_y(0.0)
+                            .include_y(2000.0); // Show up to 20 bar (2000 kPa)
+                        
+                        plot.show(ui, |plot_ui| {
+                            plot_ui.hline(HLine::new((P_ATM / 1000.0) as f64).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
+                            plot_ui.line(line);
+                        });
+                    }
                 });
             });
 
@@ -966,6 +1250,108 @@ impl eframe::App for EngenApp {
                         let s_pos = to_screen(p);
                         painter.circle_filled(s_pos, 2.0, egui::Color32::from_rgb(255, 255, 224));
                     }
+                }
+
+                // Draw Crankshaft & Cylinder if present
+                if has_engine {
+                    let theta = crank_angle;
+                    let c_center = [0.0, -0.7];
+                    let r_crank = 0.14;
+                    let l_rod = 0.45;
+                    
+                    // 1. Calculate positions
+                    let pin_x = c_center[0] + r_crank * theta.sin();
+                    let pin_y = c_center[1] + r_crank * theta.cos();
+                    let s_pin = to_screen([pin_x, pin_y]);
+                    let s_center = to_screen(c_center);
+                    
+                    let wrist_x = c_center[0];
+                    let wrist_y = c_center[1] + r_crank * theta.cos() + (l_rod * l_rod - r_crank * r_crank * theta.sin().powi(2)).max(0.0).sqrt();
+                    let s_wrist = to_screen([wrist_x, wrist_y]);
+                    
+                    // Piston height and dimensions
+                    let piston_w = 0.22;
+                    let p_top_y = wrist_y + 0.36;
+                    let p_bottom_y = wrist_y + 0.16;
+                    let s_p_left_top = to_screen([wrist_x - piston_w/2.0, p_top_y]);
+                    let s_p_right_top = to_screen([wrist_x + piston_w/2.0, p_top_y]);
+                    let s_p_right_bottom = to_screen([wrist_x + piston_w/2.0, p_bottom_y]);
+                    let s_p_left_bottom = to_screen([wrist_x - piston_w/2.0, p_bottom_y]);
+                    
+                    // 2. Draw Crankshaft counterweight
+                    painter.circle_filled(s_center, scale * 0.20, egui::Color32::from_rgba_unmultiplied(65, 65, 65, 180));
+                    painter.circle_stroke(s_center, scale * 0.20, egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)));
+                    
+                    // 3. Draw crank pin path
+                    painter.circle_stroke(s_center, scale * r_crank, egui::Stroke::new(0.5, egui::Color32::from_rgba_unmultiplied(120, 120, 120, 60)));
+                    
+                    // 4. Draw Crank Web
+                    painter.line_segment([s_center, s_pin], egui::Stroke::new(8.0, egui::Color32::from_rgb(90, 95, 100)));
+                    painter.circle_filled(s_pin, 7.0, egui::Color32::from_rgb(130, 130, 130));
+                    
+                    // 5. Draw Connecting Rod
+                    painter.line_segment([s_pin, s_wrist], egui::Stroke::new(6.0, egui::Color32::from_rgb(175, 180, 185)));
+                    
+                    // 6. Draw Piston
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![s_p_left_top, s_p_right_top, s_p_right_bottom, s_p_left_bottom],
+                        egui::Color32::from_rgb(100, 105, 110),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180)),
+                    ));
+                    
+                    // Piston rings
+                    let ring1_y = p_top_y - 0.03;
+                    let ring2_y = p_top_y - 0.06;
+                    painter.line_segment([to_screen([wrist_x - piston_w/2.0, ring1_y]), to_screen([wrist_x + piston_w/2.0, ring1_y])], egui::Stroke::new(1.5, egui::Color32::BLACK));
+                    painter.line_segment([to_screen([wrist_x - piston_w/2.0, ring2_y]), to_screen([wrist_x + piston_w/2.0, ring2_y])], egui::Stroke::new(1.5, egui::Color32::BLACK));
+                    
+                    // Wrist pin
+                    painter.circle_filled(s_wrist, 5.0, egui::Color32::from_rgb(220, 220, 220));
+                    
+                    // 7. Draw Cylinder Bore Walls
+                    let cyl_wall_x_left = wrist_x - piston_w/2.0 - 0.005;
+                    let cyl_wall_x_right = wrist_x + piston_w/2.0 + 0.005;
+                    let s_wall_left_bottom = to_screen([cyl_wall_x_left, c_center[1] + 0.15]);
+                    let s_wall_left_top = to_screen([cyl_wall_x_left, 0.35]);
+                    let s_wall_right_bottom = to_screen([cyl_wall_x_right, c_center[1] + 0.15]);
+                    let s_wall_right_top = to_screen([cyl_wall_x_right, 0.35]);
+                    
+                    let cylinder_wall_stroke = egui::Stroke::new(2.5, egui::Color32::from_rgb(80, 85, 90));
+                    painter.line_segment([s_wall_left_bottom, s_wall_left_top], cylinder_wall_stroke);
+                    painter.line_segment([s_wall_right_bottom, s_wall_right_top], cylinder_wall_stroke);
+                    
+                    // Cylinder head plate (y = 0.35)
+                    painter.line_segment([to_screen([cyl_wall_x_left, 0.35]), to_screen([cyl_wall_x_right, 0.35])], egui::Stroke::new(4.0, egui::Color32::from_rgb(80, 85, 90)));
+                    
+                    // 8. Draw Intake and Exhaust Ports
+                    // Intake tube right end is [-0.12, 0.35]. Draw a line to [-0.05, 0.35].
+                    painter.line_segment([to_screen([-0.12, 0.35]), to_screen([-0.05, 0.35])], egui::Stroke::new(6.0, egui::Color32::from_rgb(50, 50, 50)));
+                    // Exhaust tube left end is [0.12, 0.35]. Draw a line to [0.05, 0.35].
+                    painter.line_segment([to_screen([0.12, 0.35]), to_screen([0.05, 0.35])], egui::Stroke::new(6.0, egui::Color32::from_rgb(50, 50, 50)));
+                    
+                    // 9. Draw Intake and Exhaust Valves in the Head (at y = 0.35)
+                    let lift_in = get_valve_lift(theta, 350.0f32.to_radians(), 570.0f32.to_radians());
+                    let lift_ex = get_valve_lift(theta, 140.0f32.to_radians(), 380.0f32.to_radians());
+                    
+                    // Intake Valve (moves down along stem)
+                    let v_in_y = 0.35 - lift_in * 0.03;
+                    let s_v_in_head_left = to_screen([-0.08, v_in_y]);
+                    let s_v_in_head_right = to_screen([-0.02, v_in_y]);
+                    let s_v_in_stem_top = to_screen([-0.05, v_in_y + 0.05]);
+                    let s_v_in_stem_bottom = to_screen([-0.05, v_in_y]);
+                    
+                    painter.line_segment([s_v_in_stem_top, s_v_in_stem_bottom], egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 140, 0)));
+                    painter.line_segment([s_v_in_head_left, s_v_in_head_right], egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 140, 0)));
+                    
+                    // Exhaust Valve
+                    let v_ex_y = 0.35 - lift_ex * 0.03;
+                    let s_v_ex_head_left = to_screen([0.02, v_ex_y]);
+                    let s_v_ex_head_right = to_screen([0.08, v_ex_y]);
+                    let s_v_ex_stem_top = to_screen([0.05, v_ex_y + 0.05]);
+                    let s_v_ex_stem_bottom = to_screen([0.05, v_ex_y]);
+                    
+                    painter.line_segment([s_v_ex_stem_top, s_v_ex_stem_bottom], egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 191, 255)));
+                    painter.line_segment([s_v_ex_head_left, s_v_ex_head_right], egui::Stroke::new(2.5, egui::Color32::from_rgb(0, 191, 255)));
                 }
 
                 // 4. Handle drag controls and selection clicks
@@ -1137,7 +1523,7 @@ impl eframe::App for EngenApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("EnGen - 1D Compressible Network CFD Solver (Milestone 3)")
+            .with_title("EnGen - 1D Compressible Network CFD Solver (Milestone 5)")
             .with_inner_size([1200.0, 850.0]),
         ..Default::default()
     };
@@ -1173,6 +1559,26 @@ fn main() -> eframe::Result<()> {
         jones_history: Vec::new(),
         lp_cutoff_hz: default_fp.lp_cutoff_hz,
         hp_cutoff_hz: default_fp.hp_cutoff_hz,
+        
+        has_engine: false,
+        engine_rpm: 0.0,
+        engine_crank_angle: 0.0,
+        cylinder_pressure: P_ATM,
+        cylinder_volume: 0.0,
+        cyl_pressure_history: Vec::new(),
+        engine_bore: 0.08,
+        engine_stroke: 0.08,
+        engine_conrod: 0.16,
+        engine_compression_ratio: 9.0,
+        engine_inertia: 0.02,
+        engine_friction: 0.05,
+        spin_rpm: 1200.0,
+        trigger_spin: false,
+        throttle: 1.0,
+        ignition_on: true,
+        ignition_timing_deg: 15.0,
+        target_afr: 14.7,
+        audio_on: true,
     }));
     
     let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state), Arc::clone(&audio_buffer), Arc::clone(&filter_params));

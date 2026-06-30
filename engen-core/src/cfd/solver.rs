@@ -1,4 +1,6 @@
 use std::fmt;
+use crate::mechanical::{Crankshaft, get_valve_lift, piston_dy_dtheta, ValveType};
+use crate::combustion::{Cylinder, CylinderConnection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimiterType {
@@ -320,25 +322,23 @@ fn atmospheric_r_minus(gamma: f32) -> f32 {
 fn ghost_from_riemann(r_plus: f32, r_minus: f32, _gamma: f32, c_res: f32) -> [f32; 3] {
     let v_ghost = 0.5 * (r_plus + r_minus);
     let c_ghost = (0.1 * (r_plus - r_minus)).max(1.0);
-    let rho_ghost = RHO_ATM * (c_ghost / c_res).powf(5.0);
-    let p_ghost = P_ATM * (c_ghost / c_res).powf(7.0);
+    let rho_ghost = RHO_ATM * (c_ghost / c_res).powi(5);
+    let p_ghost = P_ATM * (c_ghost / c_res).powi(7);
     [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)]
 }
 
-fn smoothstep01(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+fn ghost_from_riemann_res(r_plus: f32, r_minus: f32, _gamma: f32, c_res: f32, p_res: f32, rho_res: f32) -> [f32; 3] {
+    let v_ghost = 0.5 * (r_plus + r_minus);
+    let c_ghost = (0.1 * (r_plus - r_minus)).max(1.0);
+    let rho_ghost = rho_res * (c_ghost / c_res).powi(5);
+    let p_ghost = p_res * (c_ghost / c_res).powi(7);
+    [rho_ghost.max(1e-4), v_ghost, p_ghost.max(1e-2)]
 }
 
+
 /// 0 = quiescent atmosphere, 1 = fully active Benson/open-port coupling.
-fn open_bc_activity(w: &[f32; 3]) -> f32 {
-    let p_rel = ((w[2] - P_ATM).abs() / 3000.0).min(1.0);
-    let v_rel = (w[1].abs() / 10.0).min(1.0);
-    let raw = p_rel.max(v_rel);
-    if raw < 0.03 {
-        return 0.0;
-    }
-    smoothstep01(((raw - 0.03) / 0.97).min(1.0))
+fn open_bc_activity(_w: &[f32; 3]) -> f32 {
+    1.0
 }
 
 fn lerp_primitive(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
@@ -365,6 +365,11 @@ pub struct Solver {
     pub reflection_filter: f32,
     pub step_counter: usize,
     pub cached_dt_stable: f32,
+    pub crankshaft: Option<Crankshaft>,
+    pub cylinders: Vec<Cylinder>,
+    pub ignition_on: bool,
+    pub ignition_timing_deg: f32,
+    pub target_afr: f32,
 }
 
 impl Solver {
@@ -395,6 +400,11 @@ impl Solver {
             reflection_filter: 0.75,
             step_counter: 0,
             cached_dt_stable: 0.0,
+            crankshaft: None,
+            cylinders: Vec::new(),
+            ignition_on: false,
+            ignition_timing_deg: 15.0,
+            target_afr: 14.7,
         }
     }
 
@@ -479,6 +489,88 @@ impl Solver {
             reflection_filter: 0.75,
             step_counter: 0,
             cached_dt_stable: 0.0,
+            crankshaft: None,
+            cylinders: Vec::new(),
+            ignition_on: false,
+            ignition_timing_deg: 15.0,
+            target_afr: 14.7,
+        }
+    }
+
+    pub fn new_single_cylinder() -> Self {
+        // Intake Runner (Atmosphere/throttle inlet -> cylinder port)
+        let intake_tube = Tube::new(
+            0,
+            "Intake".to_string(),
+            30,
+            [-1.2, 0.35],
+            [-0.8, 0.35],
+            [-0.4, 0.35],
+            [-0.12, 0.35],
+            0.02,
+            0.02,
+            0.02,
+            RadiusProfile::Linear,
+            BoundaryType::Valve { lift: 1.0 }, // Throttle valve
+            BoundaryType::Closed,              // connected to intake valve
+        );
+        
+        // Exhaust Runner (cylinder port -> Atmosphere outlet)
+        let exhaust_tube = Tube::new(
+            1,
+            "Exhaust".to_string(),
+            40,
+            [0.12, 0.35],
+            [0.48, 0.35],
+            [0.84, 0.35],
+            [1.2, 0.35],
+            0.02,
+            0.02,
+            0.02,
+            RadiusProfile::Linear,
+            BoundaryType::Closed, // connected to exhaust valve
+            BoundaryType::Open,   // radiates sound pressure
+        );
+
+        let conn_in = CylinderConnection {
+            tube_id: 0,
+            side: TubeSide::Right,
+            valve_type: ValveType::Intake,
+        };
+        let conn_ex = CylinderConnection {
+            tube_id: 1,
+            side: TubeSide::Left,
+            valve_type: ValveType::Exhaust,
+        };
+
+        // Single cylinder with 80mm bore, 80mm stroke, 160mm conrod, 9.0 CR
+        let cylinder = Cylinder::new(
+            0,
+            0.08,  // bore (m)
+            0.08,  // stroke (m)
+            0.16,  // conrod (m)
+            9.0,   // CR
+            vec![conn_in, conn_ex],
+        );
+
+        // Crankshaft with 0.02 kg*m^2 inertia and 0.05 friction
+        let crankshaft = Crankshaft::new(0.02, 0.05);
+
+        Self {
+            tubes: vec![intake_tube, exhaust_tube],
+            junctions: Vec::new(),
+            limiter: LimiterType::VanLeer,
+            friction: 10.0,
+            heat_transfer: 2.0,
+            t: 0.0,
+            reflection_filter: 0.75,
+            step_counter: 0,
+            cached_dt_stable: 0.0,
+            crankshaft: Some(crankshaft),
+            cylinders: vec![cylinder],
+            ignition_on: true,
+            ignition_timing_deg: 15.0,
+            target_afr: 14.7,
         }
     }
 
@@ -525,8 +617,10 @@ impl Solver {
                     max_speed = max_speed.max(velocity + speed_of_sound);
                 }
             }
-            
             let cfl = 0.8f32;
+            if max_speed.is_nan() || max_speed.is_infinite() || max_speed <= 0.0 {
+                max_speed = 340.0;
+            }
             self.cached_dt_stable = cfl * (min_dx / max_speed);
         }
         
@@ -534,7 +628,7 @@ impl Solver {
         let dt_stable = self.cached_dt_stable;
         
         // Determine number of sub-steps
-        let n_steps = (dt / dt_stable).ceil().max(1.0) as usize;
+        let n_steps = ((dt / dt_stable).ceil().max(1.0) as usize).min(200);
         let sub_dt = dt / n_steps as f32;
         
         // Store starting mass flows for correct derivative calculation over the full dt
@@ -605,6 +699,85 @@ impl Solver {
         let gamma = 1.4;
         let num_tubes = self.tubes.len();
 
+        // 1. Update Crankshaft and Piston Volumes
+        if let Some(ref mut crank) = self.crankshaft {
+            let theta_old = crank.theta;
+            
+            let mut pressure_torque = 0.0;
+            for cyl in &self.cylinders {
+                let force = (cyl.p - P_ATM) * cyl.piston_area;
+                let dy_dtheta = piston_dy_dtheta(crank.theta, cyl.stroke, cyl.conrod_length);
+                pressure_torque += force * dy_dtheta;
+            }
+            
+            // Advance crankshaft dynamics
+            crank.step(pressure_torque, dt);
+            let theta_new = crank.theta;
+            
+            // Calculate new volumes and volume increments (delta_vol)
+            for cyl in &mut self.cylinders {
+                let v_old = cyl.volume;
+                let v_new = cyl.volume_at(crank.theta);
+                cyl.volume = v_new;
+                cyl.delta_vol = v_new - v_old;
+            }
+
+            // Ignition check and combustion energy release (Wiebe Function Curve)
+            for cyl in &mut self.cylinders {
+                if self.ignition_on {
+                    let spark_angle = (4.0 * std::f32::consts::PI - self.ignition_timing_deg.to_radians()).rem_euclid(4.0 * std::f32::consts::PI);
+                    
+                    // Check if spark_angle was crossed this step to trigger combustion
+                    let diff_target = (spark_angle - theta_old).rem_euclid(4.0 * std::f32::consts::PI);
+                    let diff_step = (theta_new - theta_old).rem_euclid(4.0 * std::f32::consts::PI);
+                    
+                    if diff_target < diff_step {
+                        cyl.combustion_phase = 0.0;
+                    }
+                } else {
+                    cyl.combustion_phase = -1.0;
+                }
+                
+                // If combustion is active, apply Wiebe heat release
+                if cyl.combustion_phase >= 0.0 {
+                    let d_theta = (theta_new - theta_old).rem_euclid(4.0 * std::f32::consts::PI);
+                    let comb_duration = 50.0f32.to_radians(); // 50 degrees combustion duration
+                    
+                    let phase_old = cyl.combustion_phase;
+                    let phase_new = cyl.combustion_phase + d_theta;
+                    cyl.combustion_phase = phase_new;
+                    
+                    // Wiebe parameters: efficiency exponent a=5.0, form factor m=2.0 (so exponent is m+1=3.0)
+                    let xb_old = 1.0 - (-5.0 * (phase_old / comb_duration).powi(3)).exp();
+                    let xb_new = 1.0 - (-5.0 * (phase_new / comb_duration).powi(3)).exp();
+                    
+                    let d_xb = (xb_new - xb_old).max(0.0);
+                    
+                    let q_lhv = 44.0e6; // J/kg
+                    let eta = 0.40; // combustion thermal efficiency (realistic)
+                    let cv = R_AIR / (gamma - 1.0);
+                    
+                    let m_fuel = cyl.mass / (self.target_afr + 1.0);
+                    let delta_u = d_xb * m_fuel * q_lhv * eta;
+                    
+                    cyl.energy += delta_u;
+                    
+                    // Peak temperature cap at 2800 K
+                    let max_temp = 2800.0;
+                    let max_energy = cyl.mass * cv * max_temp;
+                    if cyl.energy > max_energy {
+                        cyl.energy = max_energy;
+                    }
+                    
+                    cyl.update_thermodynamics(gamma);
+                    
+                    if phase_new >= comb_duration {
+                        cyl.combustion_phase = -1.0; // finished
+                    }
+                }
+            }
+        }
+
         // ------------------ SSP-RK2 Step 1 ------------------
         self.apply_boundary_conditions();
         
@@ -656,9 +829,44 @@ impl Solver {
             j1[j_idx].e = (junction.e + (dt / junction.volume) * denergy).max(1e-2);
         }
 
+        // Step 1: Update Cylinder Temp States
+        for cyl in &mut self.cylinders {
+            let mut dmass = 0.0;
+            let mut denergy = 0.0;
+            for conn in &cyl.connections {
+                let tube = &self.tubes[conn.tube_id];
+                let area = if conn.side == TubeSide::Left { tube.area[1] } else { tube.area[tube.num_cells] };
+                let flux = if conn.side == TubeSide::Left { step1_left_fluxes[conn.tube_id] } else { step1_right_fluxes[conn.tube_id] };
+                match conn.side {
+                    TubeSide::Left => {
+                        dmass -= area * flux[0];
+                        denergy -= area * flux[2];
+                    }
+                    TubeSide::Right => {
+                        dmass += area * flux[0];
+                        denergy += area * flux[2];
+                    }
+                }
+            }
+            
+            cyl.mass_temp = (cyl.mass + dt * dmass).max(1e-6);
+            cyl.energy_temp = (cyl.energy - cyl.p * cyl.delta_vol + dt * denergy).max(1e-4);
+            cyl.update_thermodynamics_temp(gamma);
+        }
+
         // ------------------ SSP-RK2 Step 2 ------------------
         let filter_strength = self.reflection_filter;
-        Self::apply_network_bc(&mut self.tubes, &self.junctions, true, &j1, gamma, filter_strength);
+        let crank_theta = self.crankshaft.as_ref().map(|c| c.theta);
+        Self::apply_network_bc_cylinders(
+            &mut self.tubes,
+            &self.junctions,
+            true,
+            &j1,
+            &self.cylinders,
+            crank_theta,
+            gamma,
+            filter_strength,
+        );
         
         let mut step2_left_fluxes = Vec::with_capacity(num_tubes);
         let mut step2_right_fluxes = Vec::with_capacity(num_tubes);
@@ -722,6 +930,31 @@ impl Solver {
             junction.e = (0.5 * junction.e + 0.5 * j1[j_idx].e + 0.5 * (dt / junction.volume) * denergy).max(1e-2);
         }
 
+        // Step 2: Update Cylinder Final States
+        for cyl in &mut self.cylinders {
+            let mut dmass = 0.0;
+            let mut denergy = 0.0;
+            for conn in &cyl.connections {
+                let tube = &self.tubes[conn.tube_id];
+                let area = if conn.side == TubeSide::Left { tube.area[1] } else { tube.area[tube.num_cells] };
+                let flux = if conn.side == TubeSide::Left { step2_left_fluxes[conn.tube_id] } else { step2_right_fluxes[conn.tube_id] };
+                match conn.side {
+                    TubeSide::Left => {
+                        dmass -= area * flux[0];
+                        denergy -= area * flux[2];
+                    }
+                    TubeSide::Right => {
+                        dmass += area * flux[0];
+                        denergy += area * flux[2];
+                    }
+                }
+            }
+            
+            cyl.mass = (0.5 * cyl.mass + 0.5 * cyl.mass_temp + 0.5 * dt * dmass).max(1e-6);
+            cyl.energy = (0.5 * cyl.energy + 0.5 * cyl.energy_temp - 0.5 * cyl.p_temp * cyl.delta_vol + 0.5 * dt * denergy).max(1e-4);
+            cyl.update_thermodynamics(gamma);
+        }
+
         self.apply_boundary_conditions();
         
         self.t += dt;
@@ -730,7 +963,17 @@ impl Solver {
     pub fn apply_boundary_conditions(&mut self) {
         let gamma = 1.4;
         let filter_strength = self.reflection_filter;
-        Self::apply_network_bc(&mut self.tubes, &self.junctions, false, &self.junctions, gamma, filter_strength);
+        let crank_theta = self.crankshaft.as_ref().map(|c| c.theta);
+        Self::apply_network_bc_cylinders(
+            &mut self.tubes,
+            &self.junctions,
+            false,
+            &self.junctions,
+            &self.cylinders,
+            crank_theta,
+            gamma,
+            filter_strength,
+        );
     }
 
     fn open_left_ghost(
@@ -808,6 +1051,325 @@ impl Solver {
                 lerp_primitive(w_atm, w_benson, activity),
                 r_atm * (1.0 - activity) + r_out_filtered * activity,
             )
+        }
+    }
+
+    fn valve_left_ghost(
+        w1: [f32; 3],
+        gamma: f32,
+        p_res: f32,
+        rho_res: f32,
+        c_res: f32,
+        filter_strength: f32,
+        lift: f32,
+        last_r_out: f32,
+    ) -> ([f32; 3], f32) {
+        let w_res = [rho_res, 0.0, p_res];
+        let r_res = 2.0 * c_res / (gamma - 1.0);
+        let activity = open_bc_activity(&w1);
+        if activity <= 0.0 {
+            return (w_res, r_res);
+        }
+
+        let r_minus = w1[1] - 2.0 * (gamma * w1[2] / w1[0]).sqrt() / (gamma - 1.0);
+        let r_in = r_res;
+        let c1 = (gamma * w1[2] / w1[0]).sqrt();
+        let v_out = Self::solve_bisection_valve_res(r_in, w1[2], w1[0], c1, lift, c_res, p_res, rho_res);
+        let c_bc = 0.2 * (r_in - v_out);
+        let r_plus_reflected = (-v_out) + 2.0 * c_bc / (gamma - 1.0);
+        let alpha = if (lift - 1.0).abs() < 1e-4 {
+            filter_strength
+        } else {
+            1.0 - (1.0 - filter_strength) * lift
+        };
+        let r_out_filtered = alpha * r_plus_reflected + (1.0 - alpha) * last_r_out;
+        let w_benson = ghost_from_riemann_res(r_out_filtered, r_minus, gamma, c_res, p_res, rho_res);
+
+        if activity >= 1.0 {
+            (w_benson, r_out_filtered)
+        } else {
+            (
+                lerp_primitive(w_res, w_benson, activity),
+                r_res * (1.0 - activity) + r_out_filtered * activity,
+            )
+        }
+    }
+
+    fn valve_right_ghost(
+        wm: [f32; 3],
+        gamma: f32,
+        p_res: f32,
+        rho_res: f32,
+        c_res: f32,
+        filter_strength: f32,
+        lift: f32,
+        last_r_out: f32,
+    ) -> ([f32; 3], f32) {
+        let w_res = [rho_res, 0.0, p_res];
+        let r_res = -2.0 * c_res / (gamma - 1.0);
+        let activity = open_bc_activity(&wm);
+        if activity <= 0.0 {
+            return (w_res, r_res);
+        }
+
+        let r_plus = wm[1] + 2.0 * (gamma * wm[2] / wm[0]).sqrt() / (gamma - 1.0);
+        let r_in = 2.0 * c_res / (gamma - 1.0);
+        let cm = (gamma * wm[2] / wm[0]).sqrt();
+        let v_out = Self::solve_bisection_valve_res(r_in, wm[2], wm[0], cm, lift, c_res, p_res, rho_res);
+        let c_bc = 0.2 * (r_in - v_out);
+        let r_minus_reflected = v_out - 2.0 * c_bc / (gamma - 1.0);
+        let alpha = if (lift - 1.0).abs() < 1e-4 {
+            filter_strength
+        } else {
+            1.0 - (1.0 - filter_strength) * lift
+        };
+        let r_out_filtered = alpha * r_minus_reflected + (1.0 - alpha) * last_r_out;
+        let w_benson = ghost_from_riemann_res(r_plus, r_out_filtered, gamma, c_res, p_res, rho_res);
+
+        if activity >= 1.0 {
+            (w_benson, r_out_filtered)
+        } else {
+            (
+                lerp_primitive(w_res, w_benson, activity),
+                r_res * (1.0 - activity) + r_out_filtered * activity,
+            )
+        }
+    }
+
+    fn solve_bisection_valve_res(
+        r_in: f32,
+        p_interior: f32,
+        _rho_interior: f32,
+        c_interior: f32,
+        lift: f32,
+        c_res: f32,
+        p_res: f32,
+        rho_res: f32,
+    ) -> f32 {
+        let psi = lift.max(1e-4);
+        let c_int = c_interior.max(1e-2);
+        
+        let eval_residual = |v_out: f32| -> f32 {
+            let c_bc = 0.2 * (r_in - v_out);
+            if c_bc <= 0.0 {
+                return 1e6;
+            }
+            
+            let p_bc = p_interior * (c_bc / c_int).powi(7);
+            
+            if p_bc >= p_res - 25.0 {
+                // Outflow
+                let pr = (p_res / p_bc.max(1e-3)).max(0.0).min(1.0);
+                let phi = if pr <= 0.52828 {
+                    0.5787
+                } else {
+                    let poly = 0.174087330145 
+                             + pr * (1.845079102463 
+                             + pr * (-1.619439906917 
+                             + pr * (1.268381247447 
+                             + pr * (-0.593403052591 
+                             + pr * 0.120537101468))));
+                    (1.0 - pr).max(0.0).sqrt() * poly
+                };
+                let target_v = psi * c_bc * phi;
+                v_out - target_v
+            } else {
+                // Inflow
+                let pr = (p_bc / p_res.max(1e-3)).max(0.0).min(1.0);
+                let phi = if pr <= 0.52828 {
+                    0.5787
+                } else {
+                    let poly = 0.174087330145 
+                             + pr * (1.845079102463 
+                             + pr * (-1.619439906917 
+                             + pr * (1.268381247447 
+                             + pr * (-0.593403052591 
+                             + pr * 0.120537101468))));
+                    (1.0 - pr).max(0.0).sqrt() * poly
+                };
+                let rho_bc = rho_res * (c_bc / c_res).powi(5);
+                let g = psi * rho_res * c_res * phi;
+                let target_v = -g / rho_bc.max(1e-3);
+                v_out - target_v
+            }
+        };
+        
+        let mut low = -c_res - 200.0;
+        let mut high = (r_in - 1e-3).max(low + 10.0);
+        
+        let mut r_low = eval_residual(low);
+        let mut r_high = eval_residual(high);
+        
+        if r_low * r_high > 0.0 {
+            if r_low > 0.0 {
+                for _ in 0..15 {
+                    low -= 300.0;
+                    r_low = eval_residual(low);
+                    if r_low < 0.0 {
+                        break;
+                    }
+                }
+            } else {
+                for _ in 0..15 {
+                    high += 300.0;
+                    if high >= r_in {
+                        high = r_in - 1e-5;
+                        break;
+                    }
+                    r_high = eval_residual(high);
+                    if r_high > 0.0 {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        for _ in 0..25 {
+            let mid = 0.5 * (low + high);
+            let res = eval_residual(mid);
+            if res > 0.0 {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        
+        0.5 * (low + high)
+    }
+
+    #[allow(non_snake_case)]
+    fn apply_network_bc_cylinders(
+        tubes: &mut Vec<Tube>,
+        junctions: &Vec<Junction>,
+        use_temp: bool,
+        j_states: &Vec<Junction>,
+        cyl_states: &Vec<Cylinder>,
+        crank_theta: Option<f32>,
+        gamma: f32,
+        filter_strength: f32,
+    ) {
+        // First call the standard network BC to set junctions and standard boundaries
+        Self::apply_network_bc(tubes, junctions, use_temp, j_states, gamma, filter_strength);
+        
+        // If we have cylinders, apply valve boundary conditions to overwrite standard BCs on connected ends
+        for cyl in cyl_states {
+            let p_res = if use_temp { cyl.p_temp } else { cyl.p };
+            let rho_res = if use_temp { cyl.rho_temp } else { cyl.rho };
+            let c_res = (gamma * p_res / rho_res.max(1e-4)).sqrt();
+            
+            for conn in &cyl.connections {
+                let tube = &mut tubes[conn.tube_id];
+                let m = tube.num_cells;
+                let lift = if let Some(theta) = crank_theta {
+                    let (open_a, close_a) = match conn.valve_type {
+                        ValveType::Intake => (350.0f32.to_radians(), 570.0f32.to_radians()),
+                        ValveType::Exhaust => (140.0f32.to_radians(), 380.0f32.to_radians()),
+                    };
+                    get_valve_lift(theta, open_a, close_a)
+                } else {
+                    // Default to fully open if no crank is present (e.g. static tests)
+                    1.0
+                };
+                
+                let tube_filter = filter_strength;
+                
+                match conn.side {
+                    TubeSide::Left => {
+                        let w1 = {
+                            let state = if use_temp { &tube.u_temp } else { &tube.u };
+                            conserved_to_primitive(&state[1], gamma)
+                        };
+                        
+                        let w0;
+                        let new_r_out;
+                        
+                        if lift < 1e-6 {
+                            w0 = [w1[0], -w1[1], w1[2]];
+                            let c1 = (gamma * w1[2] / w1[0]).sqrt();
+                            let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
+                            new_r_out = Some(r_wall);
+                        } else {
+                            let (ghost, r_out) = Self::valve_left_ghost(
+                                w1,
+                                gamma,
+                                p_res,
+                                rho_res,
+                                c_res,
+                                tube_filter,
+                                lift,
+                                tube.left_last_r_out,
+                            );
+                            
+                            if lift < 0.02 {
+                                let w_wall = [w1[0], -w1[1], w1[2]];
+                                let alpha = (lift - 1e-6) / (0.02 - 1e-6);
+                                let alpha = alpha.clamp(0.0, 1.0);
+                                w0 = lerp_primitive(w_wall, ghost, alpha);
+                                
+                                let c1 = (gamma * w1[2] / w1[0]).sqrt();
+                                let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
+                                new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
+                            } else {
+                                w0 = ghost;
+                                new_r_out = Some(r_out);
+                            }
+                        }
+                        
+                        let state = if use_temp { &mut tube.u_temp } else { &mut tube.u };
+                        state[0] = primitive_to_conserved(&w0, gamma);
+                        if let Some(r) = new_r_out {
+                            tube.left_last_r_out = r;
+                        }
+                    }
+                    TubeSide::Right => {
+                        let wm = {
+                            let state = if use_temp { &tube.u_temp } else { &tube.u };
+                            conserved_to_primitive(&state[m], gamma)
+                        };
+                        
+                        let w_m1;
+                        let new_r_out;
+                        
+                        if lift < 1e-6 {
+                            w_m1 = [wm[0], -wm[1], wm[2]];
+                            let cm = (gamma * wm[2] / wm[0]).sqrt();
+                            let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
+                            new_r_out = Some(r_wall);
+                        } else {
+                            let (ghost, r_out) = Self::valve_right_ghost(
+                                wm,
+                                gamma,
+                                p_res,
+                                rho_res,
+                                c_res,
+                                tube_filter,
+                                lift,
+                                tube.right_last_r_out,
+                            );
+                            
+                            if lift < 0.02 {
+                                let w_wall = [wm[0], -wm[1], wm[2]];
+                                let alpha = (lift - 1e-6) / (0.02 - 1e-6);
+                                let alpha = alpha.clamp(0.0, 1.0);
+                                w_m1 = lerp_primitive(w_wall, ghost, alpha);
+                                
+                                let cm = (gamma * wm[2] / wm[0]).sqrt();
+                                let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
+                                new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
+                            } else {
+                                w_m1 = ghost;
+                                new_r_out = Some(r_out);
+                            }
+                        }
+                        
+                        let state = if use_temp { &mut tube.u_temp } else { &mut tube.u };
+                        state[m + 1] = primitive_to_conserved(&w_m1, gamma);
+                        if let Some(r) = new_r_out {
+                            tube.right_last_r_out = r;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -968,28 +1530,40 @@ impl Solver {
                 return 1e6; // Penalty for non-physical negative sound speeds
             }
             
-            let p_bc = p_interior * (c_bc / c_int).powf(7.0);
+            let p_bc = p_interior * (c_bc / c_int).powi(7);
             
             // Small hysteresis band avoids inflow/outflow branch chatter near atmospheric pressure.
             if p_bc >= P_ATM - 25.0 {
                 // Outflow: gas leaves pipe, expands into reservoir
-                let pr = P_ATM / p_bc.max(1e-3);
+                let pr = (P_ATM / p_bc.max(1e-3)).max(0.0).min(1.0);
                 let phi = if pr <= 0.52828 {
                     0.5787
                 } else {
-                    (5.0 * (pr.powf(1.42857) - pr.powf(1.71429))).max(0.0).sqrt()
+                    let poly = 0.174087330145 
+                             + pr * (1.845079102463 
+                             + pr * (-1.619439906917 
+                             + pr * (1.268381247447 
+                             + pr * (-0.593403052591 
+                             + pr * 0.120537101468))));
+                    (1.0 - pr).max(0.0).sqrt() * poly
                 };
                 let target_v = psi * c_bc * phi;
                 v_out - target_v
             } else {
                 // Inflow: gas enters pipe from atmospheric reservoir
-                let pr = p_bc / P_ATM;
+                let pr = (p_bc / P_ATM).max(0.0).min(1.0);
                 let phi = if pr <= 0.52828 {
                     0.5787
                 } else {
-                    (5.0 * (pr.powf(1.42857) - pr.powf(1.71429))).max(0.0).sqrt()
+                    let poly = 0.174087330145 
+                             + pr * (1.845079102463 
+                             + pr * (-1.619439906917 
+                             + pr * (1.268381247447 
+                             + pr * (-0.593403052591 
+                             + pr * 0.120537101468))));
+                    (1.0 - pr).max(0.0).sqrt() * poly
                 };
-                let rho_bc = RHO_ATM * (c_bc / c_res).powf(5.0);
+                let rho_bc = RHO_ATM * (c_bc / c_res).powi(5);
                 let g = psi * RHO_ATM * c_res * phi;
                 let target_v = -g / rho_bc.max(1e-3);
                 v_out - target_v
@@ -998,6 +1572,33 @@ impl Solver {
         
         let mut low = -c_res - 200.0;
         let mut high = (r_in - 1e-3).max(low + 10.0);
+        
+        let mut r_low = eval_residual(low);
+        let mut r_high = eval_residual(high);
+        
+        if r_low * r_high > 0.0 {
+            if r_low > 0.0 {
+                for _ in 0..15 {
+                    low -= 300.0;
+                    r_low = eval_residual(low);
+                    if r_low < 0.0 {
+                        break;
+                    }
+                }
+            } else {
+                for _ in 0..15 {
+                    high += 300.0;
+                    if high >= r_in {
+                        high = r_in - 1e-5;
+                        break;
+                    }
+                    r_high = eval_residual(high);
+                    if r_high > 0.0 {
+                        break;
+                    }
+                }
+            }
+        }
         
         for _ in 0..25 {
             let mid = 0.5 * (low + high);
@@ -1385,4 +1986,106 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_crank_slider_kinematics() {
+        use crate::mechanical::crankshaft::{piston_displacement, piston_dy_dtheta};
+        let stroke = 0.08;
+        let conrod = 0.16;
+        
+        // Piston displacement at TDC (0) should be 0
+        let tdc_disp = piston_displacement(0.0, stroke, conrod);
+        assert!(tdc_disp.abs() < 1e-5);
+        
+        // Piston displacement at BDC (PI) should be stroke
+        let bdc_disp = piston_displacement(std::f32::consts::PI, stroke, conrod);
+        assert!((bdc_disp - stroke).abs() < 1e-5);
+        
+        // dy/dtheta should be 0 at TDC (0) and BDC (PI)
+        let tdc_dy = piston_dy_dtheta(0.0, stroke, conrod);
+        let bdc_dy = piston_dy_dtheta(std::f32::consts::PI, stroke, conrod);
+        assert!(tdc_dy.abs() < 1e-5);
+        assert!(bdc_dy.abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cylinder_isentropic() {
+        // Run with closed valves to verify isentropic compression / expansion
+        let mut solver = Solver::new_single_cylinder();
+        
+        // Disconnect tubes by setting connections empty, effectively closing all valves
+        if let Some(ref mut cyl) = solver.cylinders.get_mut(0) {
+            cyl.connections.clear();
+            cyl.reset_state();
+        }
+        
+        // Spin the crankshaft up to 1000 RPM (approx 104.7 rad/s)
+        if let Some(ref mut crank) = solver.crankshaft {
+            crank.omega = 104.7;
+        }
+        
+        // Step the engine through a compression stroke (from BDC to TDC, e.g. theta goes from PI to 2*PI)
+        if let Some(ref mut crank) = solver.crankshaft {
+            crank.theta = std::f32::consts::PI; // start at BDC
+        }
+        // Force state reset at current angle
+        let initial_vol = solver.cylinders[0].volume_at(std::f32::consts::PI);
+        let initial_p = 101325.0;
+        solver.cylinders[0].volume = initial_vol;
+        solver.cylinders[0].mass = RHO_ATM * initial_vol;
+        solver.cylinders[0].energy = initial_p * initial_vol / (1.4 - 1.0);
+        solver.cylinders[0].update_thermodynamics(1.4);
+        
+        let initial_p_v_gamma = solver.cylinders[0].p * solver.cylinders[0].volume.powf(1.4);
+        
+        let sim_dt = 1.0 / 64000.0;
+        for _ in 0..100 {
+            solver.step(sim_dt);
+            
+            // Check that P * V^gamma is conserved
+            let current_p_v_gamma = solver.cylinders[0].p * solver.cylinders[0].volume.powf(1.4);
+            let rel_err = (current_p_v_gamma - initial_p_v_gamma).abs() / initial_p_v_gamma;
+            assert!(rel_err < 1e-3, "Isentropic relation violated: rel_err = {}, p = {}, v = {}", rel_err, solver.cylinders[0].p, solver.cylinders[0].volume);
+        }
+    }
+
+    #[test]
+    fn test_engine_spindown() {
+        let mut solver = Solver::new_single_cylinder();
+        
+        // Set initial high RPM
+        if let Some(ref mut crank) = solver.crankshaft {
+            crank.omega = 300.0; // ~3000 RPM
+        }
+        
+        let initial_omega = solver.crankshaft.as_ref().unwrap().omega;
+        
+        // Step solver for some time
+        let sim_dt = 1.0 / 64000.0;
+        for _ in 0..500 {
+            solver.step(sim_dt);
+        }
+        
+        let final_omega = solver.crankshaft.as_ref().unwrap().omega;
+        assert!(final_omega < initial_omega, "Engine did not slow down: initial = {}, final = {}", initial_omega, final_omega);
+    }
+
+    #[test]
+    fn test_engine_combustion_run() {
+        let mut solver = Solver::new_single_cylinder();
+        solver.ignition_on = true;
+        
+        if let Some(ref mut crank) = solver.crankshaft {
+            crank.omega = 250.0;
+        }
+        
+        let sim_dt = 1.0 / 64000.0;
+        for _ in 0..64000 {
+            solver.step(sim_dt);
+        }
+        
+        let final_omega = solver.crankshaft.as_ref().unwrap().omega;
+        assert!(final_omega > 0.0);
+    }
 }
+

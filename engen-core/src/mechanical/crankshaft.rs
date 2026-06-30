@@ -1,0 +1,65 @@
+#[derive(Debug, Clone)]
+pub struct Crankshaft {
+    pub theta: f32,          // Crank angle in radians [0, 4*PI]
+    pub omega: f32,          // Angular velocity in rad/s
+    pub inertia: f32,        // Rotational inertia in kg*m^2
+    pub friction_coeff: f32, // Viscous friction coefficient
+}
+
+impl Crankshaft {
+    pub fn new(inertia: f32, friction_coeff: f32) -> Self {
+        Self {
+            theta: 0.0,
+            omega: 0.0,
+            inertia: inertia.max(1e-4),
+            friction_coeff,
+        }
+    }
+
+    /// Step the crankshaft dynamics forward in time.
+    /// Returns the angular velocity `omega`.
+    pub fn step(&mut self, pressure_torque: f32, dt: f32) -> f32 {
+        let friction_torque = -self.friction_coeff * self.omega;
+        let net_torque = pressure_torque + friction_torque;
+        
+        // Update angular velocity (I * d_omega/dt = torque)
+        self.omega += (net_torque / self.inertia) * dt;
+        
+        // Clamp RPM to avoid numerical runaway (max 10,000 RPM ~= 1047 rad/s)
+        let max_omega = 1200.0;
+        self.omega = self.omega.clamp(-max_omega, max_omega);
+        
+        // Update crank angle (modulo 4*PI for a full four-stroke cycle)
+        let four_pi = 4.0 * std::f32::consts::PI;
+        self.theta = (self.theta + self.omega * dt).rem_euclid(four_pi);
+        
+        self.omega
+    }
+}
+
+/// Compute piston displacement from TDC (Top Dead Center) using exact crank-slider kinematics.
+/// Displacement ranges from 0.0 (at TDC) to `stroke` (at BDC).
+pub fn piston_displacement(theta: f32, stroke: f32, conrod_length: f32) -> f32 {
+    let r = stroke / 2.0;
+    let l = conrod_length;
+    let x = r * theta.cos() + (l * l - r * r * theta.sin().powi(2)).max(0.0).sqrt();
+    let max_x = r + l;
+    (max_x - x).max(0.0)
+}
+
+/// Compute the derivative dy/dtheta of piston displacement with respect to crank angle.
+/// This is used to compute volume rate-of-change and torque:
+/// Torque = Force * dy/dtheta,  dV/dt = Area * dy/dtheta * omega.
+pub fn piston_dy_dtheta(theta: f32, stroke: f32, conrod_length: f32) -> f32 {
+    let r = stroke / 2.0;
+    let l = conrod_length;
+    let sin_t = theta.sin();
+    let cos_t = theta.cos();
+    
+    let sq = (l * l - r * r * sin_t * sin_t).max(0.0);
+    if sq > 1e-6 {
+        r * sin_t + (r * r * sin_t * cos_t) / sq.sqrt()
+    } else {
+        r * sin_t
+    }
+}
