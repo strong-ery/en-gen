@@ -553,8 +553,8 @@ impl Solver {
             vec![conn_in, conn_ex],
         );
 
-        // Crankshaft with 0.02 kg*m^2 inertia and 0.05 friction
-        let crankshaft = Crankshaft::new(0.02, 0.05);
+        // Crankshaft with 0.08 kg*m^2 inertia (realistic flywheel) and 0.05 viscous friction
+        let crankshaft = Crankshaft::new(0.08, 0.05);
 
         Self {
             tubes: vec![intake_tube, exhaust_tube],

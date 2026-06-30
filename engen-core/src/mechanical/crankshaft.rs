@@ -1,9 +1,11 @@
 #[derive(Debug, Clone)]
 pub struct Crankshaft {
-    pub theta: f32,          // Crank angle in radians [0, 4*PI]
-    pub omega: f32,          // Angular velocity in rad/s
-    pub inertia: f32,        // Rotational inertia in kg*m^2
-    pub friction_coeff: f32, // Viscous friction coefficient
+    pub theta: f32,              // Crank angle in radians [0, 4*PI]
+    pub omega: f32,              // Angular velocity in rad/s
+    pub inertia: f32,            // Rotational inertia in kg*m^2
+    pub friction_coeff: f32,     // Viscous friction coefficient
+    pub coulomb_friction: f32,   // Coulomb (static/dry) friction torque in N*m
+    pub starter_torque: f32,     // Starter motor torque applied when engaged (N*m)
 }
 
 impl Crankshaft {
@@ -13,21 +15,46 @@ impl Crankshaft {
             omega: 0.0,
             inertia: inertia.max(1e-4),
             friction_coeff,
+            coulomb_friction: 0.5, // Default: 0.5 N*m dry friction from piston rings/bearings
+            starter_torque: 0.0,   // No starter torque by default
         }
     }
 
     /// Step the crankshaft dynamics forward in time.
     /// Returns the angular velocity `omega`.
     pub fn step(&mut self, pressure_torque: f32, dt: f32) -> f32 {
-        let friction_torque = -self.friction_coeff * self.omega;
-        let net_torque = pressure_torque + friction_torque;
+        // Viscous friction (proportional to speed)
+        let viscous_torque = -self.friction_coeff * self.omega;
+        
+        // Coulomb (dry) friction: constant magnitude, opposes motion direction
+        let coulomb_torque = if self.omega.abs() > 1e-3 {
+            -self.coulomb_friction * self.omega.signum()
+        } else {
+            // At near-zero speed, Coulomb friction opposes net driving torque (stiction)
+            let driving = pressure_torque + viscous_torque + self.starter_torque;
+            if driving.abs() > self.coulomb_friction {
+                -self.coulomb_friction * driving.signum()
+            } else {
+                // Not enough torque to overcome static friction — hold at zero
+                -driving
+            }
+        };
+        
+        let net_torque = pressure_torque + viscous_torque + coulomb_torque + self.starter_torque;
         
         // Update angular velocity (I * d_omega/dt = torque)
         self.omega += (net_torque / self.inertia) * dt;
         
-        // Clamp RPM to avoid numerical runaway (max 10,000 RPM ~= 1047 rad/s)
+        // Prevent reverse rotation: engine only spins forward
+        if self.omega < 0.0 {
+            self.omega = 0.0;
+        }
+        
+        // Clamp RPM to avoid numerical runaway (max ~11,500 RPM = 1200 rad/s)
         let max_omega = 1200.0;
-        self.omega = self.omega.clamp(-max_omega, max_omega);
+        if self.omega > max_omega {
+            self.omega = max_omega;
+        }
         
         // Update crank angle (modulo 4*PI for a full four-stroke cycle)
         let four_pi = 4.0 * std::f32::consts::PI;

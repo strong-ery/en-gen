@@ -106,6 +106,10 @@ struct SharedState {
     pub ignition_timing_deg: f32,
     pub target_afr: f32,
     pub audio_on: bool,
+
+    // Starter motor state
+    pub starter_engaged: bool,
+    pub starter_timer: f32,    // Remaining starter duration in seconds
 }
 
 fn spawn_solver_thread(
@@ -175,7 +179,7 @@ fn spawn_solver_thread(
                     solver.ignition_timing_deg = state.ignition_timing_deg;
                     solver.target_afr = state.target_afr;
                     
-                    // Spin Up Trigger
+                    // Legacy Spin Up Trigger (kept for debug button)
                     if state.trigger_spin {
                         state.trigger_spin = false;
                         if let Some(ref mut crank) = solver.crankshaft {
@@ -183,9 +187,30 @@ fn spawn_solver_thread(
                         }
                     }
                     
-                    // Throttle mapping
+                    // Starter motor: apply sustained cranking torque
+                    if let Some(ref mut crank) = solver.crankshaft {
+                        if state.starter_engaged && state.starter_timer > 0.0 {
+                            crank.starter_torque = 45.0; // N*m at the crank - enough to push through compression stroke resistance
+                            
+                            // Auto-disengage once engine catches (sustained above 600 RPM)
+                            let rpm = (crank.omega * 60.0) / (2.0 * std::f32::consts::PI);
+                            if rpm > 600.0 {
+                                state.starter_engaged = false;
+                                state.starter_timer = 0.0;
+                                crank.starter_torque = 0.0;
+                            }
+                        } else {
+                            crank.starter_torque = 0.0;
+                            if state.starter_engaged {
+                                state.starter_engaged = false; // timer ran out
+                            }
+                        }
+                    }
+                    
+                    // Throttle mapping with idle air bypass (minimum 3% opening)
                     if solver.crankshaft.is_some() && !solver.tubes.is_empty() {
-                        solver.tubes[0].left_bc = BoundaryType::Valve { lift: state.throttle };
+                        let lift = state.throttle.max(0.03); // idle bypass
+                        solver.tubes[0].left_bc = BoundaryType::Valve { lift };
                     }
                     
                     // Sync engine mechanical parameters
@@ -211,6 +236,13 @@ fn spawn_solver_thread(
 
                     // Sync valve lifts dynamically without resetting
                     for (k, tube) in solver.tubes.iter_mut().enumerate() {
+                        if k == 0 && solver.crankshaft.is_some() {
+                            // Tube 0 is the throttle-controlled intake boundary when an engine
+                            // is present; its lift is driven by `state.throttle` above, not by
+                            // the UI tube mirror, so skip it here or we'd immediately overwrite
+                            // the throttle value with the stale UI copy.
+                            continue;
+                        }
                         if k < state.tubes.len() {
                             if let BoundaryType::Valve { lift } = state.tubes[k].left_bc {
                                 if let BoundaryType::Valve { lift: ref mut l_lift } = tube.left_bc {
@@ -366,6 +398,11 @@ fn spawn_solver_thread(
                         state.junctions = solver.junctions.clone();
                         state.time = solver.t;
                         state.jones_history = local_jones_history.clone();
+                        
+                        // Decrement starter timer by simulated time elapsed
+                        if state.starter_engaged && state.starter_timer > 0.0 {
+                            state.starter_timer -= steps_run as f32 * sim_dt;
+                        }
                         
                         if let Some(ref crank) = solver.crankshaft {
                             state.has_engine = true;
@@ -539,7 +576,7 @@ impl eframe::App for EngenApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
         }
 
-        let (tubes, junctions, current_time, rtf, sps, has_engine, engine_rpm, crank_angle, cyl_p, cyl_v) = {
+        let (tubes, junctions, current_time, rtf, sps, has_engine, engine_rpm, crank_angle, cyl_p, cyl_v, eng_bore, eng_stroke, eng_conrod) = {
             let mut state = self.shared_state.lock().unwrap();
             
             // Sync control inputs to shared state config
@@ -575,6 +612,9 @@ impl eframe::App for EngenApp {
                 state.engine_crank_angle,
                 state.cylinder_pressure,
                 state.cylinder_volume,
+                state.engine_bore,
+                state.engine_stroke,
+                state.engine_conrod,
             )
         };
         
@@ -656,15 +696,27 @@ impl eframe::App for EngenApp {
 
                         ui.add_space(5.0);
 
+                        // Check starter state
+                        let starter_active = {
+                            if let Ok(state) = self.shared_state.lock() {
+                                state.starter_engaged && state.starter_timer > 0.0
+                            } else {
+                                false
+                            }
+                        };
+
                         ui.horizontal(|ui| {
-                            if engine_rpm < 100.0 {
+                            if engine_rpm < 100.0 && !starter_active {
                                 if ui.button("⚡ Start Engine (Crank)").clicked() {
                                     self.ignition_on_input = true;
                                     if let Ok(mut state) = self.shared_state.lock() {
-                                        state.trigger_spin = true;
-                                        state.spin_rpm = 1000.0;
+                                        state.starter_engaged = true;
+                                        state.starter_timer = 2.0; // 2 second crank window
+                                        state.ignition_on = true;
                                     }
                                 }
+                            } else if starter_active {
+                                ui.label(egui::RichText::new("⚡ Cranking...").color(egui::Color32::YELLOW));
                             } else {
                                 if ui.button("🔌 Kill Engine (Stop)").clicked() {
                                     self.ignition_on_input = false;
@@ -1255,103 +1307,143 @@ impl eframe::App for EngenApp {
                 // Draw Crankshaft & Cylinder if present
                 if has_engine {
                     let theta = crank_angle;
-                    let c_center = [0.0, -0.7];
-                    let r_crank = 0.14;
-                    let l_rod = 0.45;
                     
-                    // 1. Calculate positions
+                    // Use actual engine geometry scaled for viewport display.
+                    // Physics dimensions are in meters (~0.04-0.08m), viewport is ~[-2.5, 2.5].
+                    // We apply a visual scale to make it fill the viewport nicely.
+                    let vis_scale = 3.5; // meters → viewport units
+                    
+                    let r_crank = (eng_stroke / 2.0) * vis_scale; // crank radius
+                    let l_rod = eng_conrod * vis_scale;            // connecting rod length
+                    let piston_w = eng_bore * vis_scale;           // piston width = bore
+                    let piston_h = piston_w * 0.5;                 // piston height (visual proportional to bore)
+                    
+                    // Crankshaft center position — placed so cylinder head lands at y ≈ 0.35
+                    // TDC wrist_y = c_center_y + r + l, head_y = TDC_wrist + piston_h/2 + clearance
+                    let head_y = 0.35;
+                    let tdc_wrist_y = head_y - piston_h / 2.0 - 0.02; // 0.02 clearance gap
+                    let c_center_y = tdc_wrist_y - r_crank - l_rod;
+                    let c_center = [0.0, c_center_y];
+                    
+                    // 1. Calculate positions using exact crank-slider kinematics
                     let pin_x = c_center[0] + r_crank * theta.sin();
                     let pin_y = c_center[1] + r_crank * theta.cos();
                     let s_pin = to_screen([pin_x, pin_y]);
                     let s_center = to_screen(c_center);
                     
+                    // Wrist pin: exact crank-slider formula (matches physics in crankshaft.rs)
                     let wrist_x = c_center[0];
-                    let wrist_y = c_center[1] + r_crank * theta.cos() + (l_rod * l_rod - r_crank * r_crank * theta.sin().powi(2)).max(0.0).sqrt();
+                    let wrist_y = c_center[1] + r_crank * theta.cos() 
+                        + (l_rod * l_rod - r_crank * r_crank * theta.sin().powi(2)).max(0.0).sqrt();
                     let s_wrist = to_screen([wrist_x, wrist_y]);
                     
-                    // Piston height and dimensions
-                    let piston_w = 0.22;
-                    let p_top_y = wrist_y + 0.36;
-                    let p_bottom_y = wrist_y + 0.16;
-                    let s_p_left_top = to_screen([wrist_x - piston_w/2.0, p_top_y]);
-                    let s_p_right_top = to_screen([wrist_x + piston_w/2.0, p_top_y]);
-                    let s_p_right_bottom = to_screen([wrist_x + piston_w/2.0, p_bottom_y]);
-                    let s_p_left_bottom = to_screen([wrist_x - piston_w/2.0, p_bottom_y]);
+                    // Piston body centered on wrist pin
+                    let p_top_y = wrist_y + piston_h / 2.0;
+                    let p_bottom_y = wrist_y - piston_h / 2.0;
+                    let s_p_left_top = to_screen([wrist_x - piston_w / 2.0, p_top_y]);
+                    let s_p_right_top = to_screen([wrist_x + piston_w / 2.0, p_top_y]);
+                    let s_p_right_bottom = to_screen([wrist_x + piston_w / 2.0, p_bottom_y]);
+                    let s_p_left_bottom = to_screen([wrist_x - piston_w / 2.0, p_bottom_y]);
                     
-                    // 2. Draw Crankshaft counterweight
-                    painter.circle_filled(s_center, scale * 0.20, egui::Color32::from_rgba_unmultiplied(65, 65, 65, 180));
-                    painter.circle_stroke(s_center, scale * 0.20, egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)));
+                    // 2. Draw Crankshaft counterweight (sized relative to crank radius)
+                    let cw_radius = r_crank * 1.4;
+                    painter.circle_filled(s_center, scale * cw_radius, egui::Color32::from_rgba_unmultiplied(65, 65, 65, 180));
+                    painter.circle_stroke(s_center, scale * cw_radius, egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)));
                     
-                    // 3. Draw crank pin path
+                    // 3. Draw crank pin orbit path
                     painter.circle_stroke(s_center, scale * r_crank, egui::Stroke::new(0.5, egui::Color32::from_rgba_unmultiplied(120, 120, 120, 60)));
                     
-                    // 4. Draw Crank Web
+                    // 4. Draw Crank Web (arm from center to pin)
                     painter.line_segment([s_center, s_pin], egui::Stroke::new(8.0, egui::Color32::from_rgb(90, 95, 100)));
                     painter.circle_filled(s_pin, 7.0, egui::Color32::from_rgb(130, 130, 130));
                     
-                    // 5. Draw Connecting Rod
+                    // 5. Draw Connecting Rod (from crank pin to wrist pin)
                     painter.line_segment([s_pin, s_wrist], egui::Stroke::new(6.0, egui::Color32::from_rgb(175, 180, 185)));
                     
-                    // 6. Draw Piston
+                    // 6. Draw Piston body
                     painter.add(egui::Shape::convex_polygon(
                         vec![s_p_left_top, s_p_right_top, s_p_right_bottom, s_p_left_bottom],
                         egui::Color32::from_rgb(100, 105, 110),
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180)),
                     ));
                     
-                    // Piston rings
-                    let ring1_y = p_top_y - 0.03;
-                    let ring2_y = p_top_y - 0.06;
-                    painter.line_segment([to_screen([wrist_x - piston_w/2.0, ring1_y]), to_screen([wrist_x + piston_w/2.0, ring1_y])], egui::Stroke::new(1.5, egui::Color32::BLACK));
-                    painter.line_segment([to_screen([wrist_x - piston_w/2.0, ring2_y]), to_screen([wrist_x + piston_w/2.0, ring2_y])], egui::Stroke::new(1.5, egui::Color32::BLACK));
+                    // Piston rings (near crown)
+                    let ring1_y = p_top_y - piston_h * 0.15;
+                    let ring2_y = p_top_y - piston_h * 0.30;
+                    painter.line_segment(
+                        [to_screen([wrist_x - piston_w / 2.0, ring1_y]), to_screen([wrist_x + piston_w / 2.0, ring1_y])],
+                        egui::Stroke::new(1.5, egui::Color32::BLACK),
+                    );
+                    painter.line_segment(
+                        [to_screen([wrist_x - piston_w / 2.0, ring2_y]), to_screen([wrist_x + piston_w / 2.0, ring2_y])],
+                        egui::Stroke::new(1.5, egui::Color32::BLACK),
+                    );
                     
                     // Wrist pin
                     painter.circle_filled(s_wrist, 5.0, egui::Color32::from_rgb(220, 220, 220));
                     
                     // 7. Draw Cylinder Bore Walls
-                    let cyl_wall_x_left = wrist_x - piston_w/2.0 - 0.005;
-                    let cyl_wall_x_right = wrist_x + piston_w/2.0 + 0.005;
-                    let s_wall_left_bottom = to_screen([cyl_wall_x_left, c_center[1] + 0.15]);
-                    let s_wall_left_top = to_screen([cyl_wall_x_left, 0.35]);
-                    let s_wall_right_bottom = to_screen([cyl_wall_x_right, c_center[1] + 0.15]);
-                    let s_wall_right_top = to_screen([cyl_wall_x_right, 0.35]);
+                    let wall_gap = 0.005; // small gap between piston and cylinder wall
+                    let cyl_wall_x_left = wrist_x - piston_w / 2.0 - wall_gap;
+                    let cyl_wall_x_right = wrist_x + piston_w / 2.0 + wall_gap;
+                    // Walls extend from below BDC piston skirt to the head
+                    let bdc_wrist_y = c_center_y + (l_rod - r_crank); // BDC wrist position
+                    let wall_bottom_y = bdc_wrist_y - piston_h * 0.8;
+                    let s_wall_left_bottom = to_screen([cyl_wall_x_left, wall_bottom_y]);
+                    let s_wall_left_top = to_screen([cyl_wall_x_left, head_y]);
+                    let s_wall_right_bottom = to_screen([cyl_wall_x_right, wall_bottom_y]);
+                    let s_wall_right_top = to_screen([cyl_wall_x_right, head_y]);
                     
                     let cylinder_wall_stroke = egui::Stroke::new(2.5, egui::Color32::from_rgb(80, 85, 90));
                     painter.line_segment([s_wall_left_bottom, s_wall_left_top], cylinder_wall_stroke);
                     painter.line_segment([s_wall_right_bottom, s_wall_right_top], cylinder_wall_stroke);
                     
-                    // Cylinder head plate (y = 0.35)
-                    painter.line_segment([to_screen([cyl_wall_x_left, 0.35]), to_screen([cyl_wall_x_right, 0.35])], egui::Stroke::new(4.0, egui::Color32::from_rgb(80, 85, 90)));
+                    // Cylinder head plate
+                    painter.line_segment(
+                        [to_screen([cyl_wall_x_left, head_y]), to_screen([cyl_wall_x_right, head_y])],
+                        egui::Stroke::new(4.0, egui::Color32::from_rgb(80, 85, 90)),
+                    );
                     
-                    // 8. Draw Intake and Exhaust Ports
-                    // Intake tube right end is [-0.12, 0.35]. Draw a line to [-0.05, 0.35].
-                    painter.line_segment([to_screen([-0.12, 0.35]), to_screen([-0.05, 0.35])], egui::Stroke::new(6.0, egui::Color32::from_rgb(50, 50, 50)));
-                    // Exhaust tube left end is [0.12, 0.35]. Draw a line to [0.05, 0.35].
-                    painter.line_segment([to_screen([0.12, 0.35]), to_screen([0.05, 0.35])], egui::Stroke::new(6.0, egui::Color32::from_rgb(50, 50, 50)));
+                    // 8. Draw Intake and Exhaust Ports (connecting to tube endpoints at head_y)
+                    let port_half = piston_w / 2.0 + wall_gap;
+                    painter.line_segment(
+                        [to_screen([-0.12, head_y]), to_screen([-port_half * 0.3, head_y])],
+                        egui::Stroke::new(6.0, egui::Color32::from_rgb(50, 50, 50)),
+                    );
+                    painter.line_segment(
+                        [to_screen([0.12, head_y]), to_screen([port_half * 0.3, head_y])],
+                        egui::Stroke::new(6.0, egui::Color32::from_rgb(50, 50, 50)),
+                    );
                     
-                    // 9. Draw Intake and Exhaust Valves in the Head (at y = 0.35)
+                    // 9. Draw Intake and Exhaust Valves in the Head
                     let lift_in = get_valve_lift(theta, 350.0f32.to_radians(), 570.0f32.to_radians());
                     let lift_ex = get_valve_lift(theta, 140.0f32.to_radians(), 380.0f32.to_radians());
                     
-                    // Intake Valve (moves down along stem)
-                    let v_in_y = 0.35 - lift_in * 0.03;
-                    let s_v_in_head_left = to_screen([-0.08, v_in_y]);
-                    let s_v_in_head_right = to_screen([-0.02, v_in_y]);
-                    let s_v_in_stem_top = to_screen([-0.05, v_in_y + 0.05]);
-                    let s_v_in_stem_bottom = to_screen([-0.05, v_in_y]);
-                    
-                    painter.line_segment([s_v_in_stem_top, s_v_in_stem_bottom], egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 140, 0)));
-                    painter.line_segment([s_v_in_head_left, s_v_in_head_right], egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 140, 0)));
+                    // Intake Valve (moves down from head when open)
+                    let valve_drop = 0.03; // max visual displacement when fully open
+                    let v_in_y = head_y - lift_in * valve_drop;
+                    let v_in_cx = -piston_w * 0.18; // centered on intake side
+                    let valve_head_w = piston_w * 0.22;
+                    painter.line_segment(
+                        [to_screen([v_in_cx, v_in_y + 0.05]), to_screen([v_in_cx, v_in_y])],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 140, 0)),
+                    );
+                    painter.line_segment(
+                        [to_screen([v_in_cx - valve_head_w, v_in_y]), to_screen([v_in_cx + valve_head_w, v_in_y])],
+                        egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 140, 0)),
+                    );
                     
                     // Exhaust Valve
-                    let v_ex_y = 0.35 - lift_ex * 0.03;
-                    let s_v_ex_head_left = to_screen([0.02, v_ex_y]);
-                    let s_v_ex_head_right = to_screen([0.08, v_ex_y]);
-                    let s_v_ex_stem_top = to_screen([0.05, v_ex_y + 0.05]);
-                    let s_v_ex_stem_bottom = to_screen([0.05, v_ex_y]);
-                    
-                    painter.line_segment([s_v_ex_stem_top, s_v_ex_stem_bottom], egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 191, 255)));
-                    painter.line_segment([s_v_ex_head_left, s_v_ex_head_right], egui::Stroke::new(2.5, egui::Color32::from_rgb(0, 191, 255)));
+                    let v_ex_y = head_y - lift_ex * valve_drop;
+                    let v_ex_cx = piston_w * 0.18; // centered on exhaust side
+                    painter.line_segment(
+                        [to_screen([v_ex_cx, v_ex_y + 0.05]), to_screen([v_ex_cx, v_ex_y])],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 191, 255)),
+                    );
+                    painter.line_segment(
+                        [to_screen([v_ex_cx - valve_head_w, v_ex_y]), to_screen([v_ex_cx + valve_head_w, v_ex_y])],
+                        egui::Stroke::new(2.5, egui::Color32::from_rgb(0, 191, 255)),
+                    );
                 }
 
                 // 4. Handle drag controls and selection clicks
@@ -1570,7 +1662,7 @@ fn main() -> eframe::Result<()> {
         engine_stroke: 0.08,
         engine_conrod: 0.16,
         engine_compression_ratio: 9.0,
-        engine_inertia: 0.02,
+        engine_inertia: 0.08,
         engine_friction: 0.05,
         spin_rpm: 1200.0,
         trigger_spin: false,
@@ -1579,6 +1671,8 @@ fn main() -> eframe::Result<()> {
         ignition_timing_deg: 15.0,
         target_afr: 14.7,
         audio_on: true,
+        starter_engaged: false,
+        starter_timer: 0.0,
     }));
     
     let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state), Arc::clone(&audio_buffer), Arc::clone(&filter_params));
