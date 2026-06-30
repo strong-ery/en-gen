@@ -15,7 +15,7 @@ pub struct AudioFilterParams {
 impl Default for AudioFilterParams {
     fn default() -> Self {
         Self {
-            lp_cutoff_hz: 5500.0,
+            lp_cutoff_hz: 20000.0,
             hp_cutoff_hz: 1.0,
         }
     }

@@ -383,6 +383,12 @@ impl eframe::App for EngenApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint(); // Redraw constantly for smooth physics and flow animation
         
+        // Fullscreen hotkey check (F11)
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+        }
+
         let (tubes, junctions, current_time, rtf, sps) = {
             let mut state = self.shared_state.lock().unwrap();
             
@@ -405,286 +411,416 @@ impl eframe::App for EngenApp {
         
         // ------------------ Side Panel Controls ------------------
         egui::SidePanel::left("control_panel").width_range(280.0..=350.0).show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading("EnGen CFD Visualizer");
-                ui.label(egui::RichText::new("Milestone 2: Y-Junctions & Geometry").weak());
-            });
-            
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(5.0);
-            
-            // Scenario Presets
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Preset Scenarios").strong());
-                let old_preset = self.preset_selection;
-                egui::ComboBox::from_id_source("preset_combo")
-                    .selected_text(format!("{}", self.preset_selection))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.preset_selection, PresetType::Straight, "Straight Tube");
-                        ui.selectable_value(&mut self.preset_selection, PresetType::Taper, "Tapered Tube");
-                        ui.selectable_value(&mut self.preset_selection, PresetType::ExpansionChamber, "Expansion Chamber");
-                        ui.selectable_value(&mut self.preset_selection, PresetType::YJunction, "Y-Junction Exhaust");
-                    });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading("EnGen CFD Visualizer");
+                    ui.label(egui::RichText::new("Milestone 2: Y-Junctions & Geometry").weak());
+                });
                 
-                if self.preset_selection != old_preset {
-                    let mut state = self.shared_state.lock().unwrap();
-                    state.preset_type = Some(self.preset_selection);
-                    self.selected_tube_id = Some(0);
-                    // Defer reseed particles until next frame once solver recreates tubes
-                    ctx.request_repaint();
-                }
-            });
-            
-            ui.add_space(10.0);
-
-            // Simulation Stats
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Performance Metrics").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Time Step Rate:");
-                    ui.label(egui::RichText::new(format!("{:.0} Hz", sps)).color(egui::Color32::LIGHT_GREEN));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Real-Time Factor:");
-                    let color = if rtf >= 0.95 { egui::Color32::LIGHT_GREEN } else if rtf > 0.1 { egui::Color32::LIGHT_YELLOW } else { egui::Color32::LIGHT_RED };
-                    ui.label(egui::RichText::new(format!("{:.2}x", rtf)).color(color));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Simulated Time:");
-                    ui.label(format!("{:.5} s", current_time));
-                });
-            });
-            
-            ui.add_space(10.0);
-            
-            // Simulation Controls
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Simulation Controls").strong());
-                ui.horizontal(|ui| {
-                    if ui.button("⏸ Pause").clicked() {
-                        self.speed_input = 0.0;
-                    }
-                    if ui.button("▶ Play").clicked() && self.speed_input == 0.0 {
-                        self.speed_input = 1.0;
-                    }
-                    if ui.button("🔄 Reset").clicked() {
-                        let mut state = self.shared_state.lock().unwrap();
-                        state.reset_trigger = true;
-                    }
-                });
-                ui.add(egui::Slider::new(&mut self.speed_input, 0.0..=2.0).text("Speed Multiplier").suffix("x"));
-            });
-            
-            ui.add_space(10.0);
-            
-            // Pulse Injection
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Pulse Injection (Main Tube)").strong());
-                ui.add(egui::Slider::new(&mut self.amplitude_input, 1000.0..=50000.0).text("Amplitude").suffix(" Pa"));
-                ui.add(egui::Slider::new(&mut self.width_input, 0.02..=0.30).text("Width").suffix(" m"));
-                if ui.button("💥 Inject Pressure Pulse").clicked() {
-                    let mut state = self.shared_state.lock().unwrap();
-                    state.pulse_amplitude = self.amplitude_input;
-                    state.pulse_width = self.width_input;
-                    state.inject_pulse = true;
-                }
-            });
-            
-            ui.add_space(10.0);
-            
-            // Solver Configuration
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Global Physics Settings").strong());
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(5.0);
                 
-                ui.horizontal(|ui| {
-                    ui.label("Limiter:");
-                    egui::ComboBox::from_id_source("limiter_box")
-                        .selected_text(format!("{}", self.limiter_input))
+                // Scenario Presets
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Preset Scenarios").strong());
+                    let old_preset = self.preset_selection;
+                    egui::ComboBox::from_id_source("preset_combo")
+                        .selected_text(format!("{}", self.preset_selection))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.limiter_input, LimiterType::None, "None (1st Order)");
-                            ui.selectable_value(&mut self.limiter_input, LimiterType::Minmod, "Minmod");
-                            ui.selectable_value(&mut self.limiter_input, LimiterType::MC, "Monotonized Central (MC)");
-                            ui.selectable_value(&mut self.limiter_input, LimiterType::VanLeer, "Van Leer");
-                            ui.selectable_value(&mut self.limiter_input, LimiterType::Superbee, "Superbee");
+                            ui.selectable_value(&mut self.preset_selection, PresetType::Straight, "Straight Tube");
+                            ui.selectable_value(&mut self.preset_selection, PresetType::Taper, "Tapered Tube");
+                            ui.selectable_value(&mut self.preset_selection, PresetType::ExpansionChamber, "Expansion Chamber");
+                            ui.selectable_value(&mut self.preset_selection, PresetType::YJunction, "Y-Junction Exhaust");
                         });
+                    
+                    if self.preset_selection != old_preset {
+                        let mut state = self.shared_state.lock().unwrap();
+                        state.preset_type = Some(self.preset_selection);
+                        self.selected_tube_id = Some(0);
+                        // Defer reseed particles until next frame once solver recreates tubes
+                        ctx.request_repaint();
+                    }
                 });
                 
-                ui.add(egui::Slider::new(&mut self.friction_input, 0.0..=50.0).text("Wall Friction"));
-                ui.add(egui::Slider::new(&mut self.heat_transfer_input, 0.0..=200.0).text("Wall Heat Transfer"));
-                ui.add(egui::Slider::new(&mut self.volume_input, 0.0..=1.0).text("Audio Volume"));
-                ui.add(egui::Slider::new(&mut self.reflection_input, 0.5..=1.0).text("Reflection Filter"));
-            });
-            
-            ui.add_space(10.0);
-            
-            // Audio Filter Controls
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Audio Filters").strong());
-                ui.label(egui::RichText::new("Adjust to trim crackling / rumble").weak().size(11.0));
-                if ui.add(egui::Slider::new(&mut self.lp_cutoff_input, 500.0..=20000.0)
-                    .text("LP Cutoff")
-                    .suffix(" Hz")
-                    .logarithmic(true)
-                ).changed() {
-                    if let Ok(mut fp) = self.filter_params.lock() {
-                        fp.lp_cutoff_hz = self.lp_cutoff_input;
+                ui.add_space(10.0);
+
+                // Simulation Stats
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Performance Metrics").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Time Step Rate:");
+                        ui.label(egui::RichText::new(format!("{:.0} Hz", sps)).color(egui::Color32::LIGHT_GREEN));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Real-Time Factor:");
+                        let color = if rtf >= 0.95 { egui::Color32::LIGHT_GREEN } else if rtf > 0.1 { egui::Color32::LIGHT_YELLOW } else { egui::Color32::LIGHT_RED };
+                        ui.label(egui::RichText::new(format!("{:.2}x", rtf)).color(color));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Simulated Time:");
+                        ui.label(format!("{:.5} s", current_time));
+                    });
+                });
+                
+                ui.add_space(10.0);
+                
+                // Simulation Controls
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Simulation Controls").strong());
+                    ui.horizontal(|ui| {
+                        if ui.button("⏸ Pause").clicked() {
+                            self.speed_input = 0.0;
+                        }
+                        if ui.button("▶ Play").clicked() && self.speed_input == 0.0 {
+                            self.speed_input = 1.0;
+                        }
+                        if ui.button("🔄 Reset").clicked() {
+                            let mut state = self.shared_state.lock().unwrap();
+                            state.reset_trigger = true;
+                        }
+                    });
+                    ui.add(egui::Slider::new(&mut self.speed_input, 0.0..=2.0).text("Speed Multiplier").suffix("x"));
+                    
+                    ui.horizontal(|ui| {
+                        let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                        let btn_txt = if is_fullscreen { "🗖 Windowed" } else { "🖵 Fullscreen" };
+                        if ui.button(btn_txt).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+                        }
+                        ui.label(egui::RichText::new("(or F11)").weak().size(11.0));
+                    });
+                });
+                
+                ui.add_space(10.0);
+                
+                // Pulse Injection
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Pulse Injection (Main Tube)").strong());
+                    ui.add(egui::Slider::new(&mut self.amplitude_input, 1000.0..=50000.0).text("Amplitude").suffix(" Pa"));
+                    ui.add(egui::Slider::new(&mut self.width_input, 0.02..=0.30).text("Width").suffix(" m"));
+                    if ui.button("💥 Inject Pressure Pulse").clicked() {
+                        let mut state = self.shared_state.lock().unwrap();
+                        state.pulse_amplitude = self.amplitude_input;
+                        state.pulse_width = self.width_input;
+                        state.inject_pulse = true;
                     }
-                }
-                if ui.add(egui::Slider::new(&mut self.hp_cutoff_input, 1.0..=5000.0)
-                    .text("HP Cutoff")
-                    .suffix(" Hz")
-                    .logarithmic(true)
-                ).changed() {
-                    if let Ok(mut fp) = self.filter_params.lock() {
-                        fp.hp_cutoff_hz = self.hp_cutoff_input;
+                });
+                
+                ui.add_space(10.0);
+                
+                // Solver Configuration
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Global Physics Settings").strong());
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Limiter:");
+                        egui::ComboBox::from_id_source("limiter_box")
+                            .selected_text(format!("{}", self.limiter_input))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.limiter_input, LimiterType::None, "None (1st Order)");
+                                ui.selectable_value(&mut self.limiter_input, LimiterType::Minmod, "Minmod");
+                                ui.selectable_value(&mut self.limiter_input, LimiterType::MC, "Monotonized Central (MC)");
+                                ui.selectable_value(&mut self.limiter_input, LimiterType::VanLeer, "Van Leer");
+                                ui.selectable_value(&mut self.limiter_input, LimiterType::Superbee, "Superbee");
+                            });
+                    });
+                    
+                    ui.add(egui::Slider::new(&mut self.friction_input, 0.0..=50.0).text("Wall Friction"));
+                    ui.add(egui::Slider::new(&mut self.heat_transfer_input, 0.0..=200.0).text("Wall Heat Transfer"));
+                    ui.add(egui::Slider::new(&mut self.volume_input, 0.0..=1.0).text("Audio Volume"));
+                    ui.add(egui::Slider::new(&mut self.reflection_input, 0.5..=1.0).text("Reflection Filter"));
+                });
+                
+                ui.add_space(10.0);
+                
+                // Audio Filter Controls
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Audio Filters").strong());
+                    ui.label(egui::RichText::new("Adjust to trim crackling / rumble").weak().size(11.0));
+                    if ui.add(egui::Slider::new(&mut self.lp_cutoff_input, 500.0..=20000.0)
+                        .text("LP Cutoff")
+                        .suffix(" Hz")
+                        .logarithmic(true)
+                    ).changed() {
+                        if let Ok(mut fp) = self.filter_params.lock() {
+                            fp.lp_cutoff_hz = self.lp_cutoff_input;
+                        }
                     }
-                }
-            });
-
-            // Geometry editor panel for selected tube
-            if let Some(tube_id) = self.selected_tube_id {
-                if tube_id < tubes.len() {
-                    ui.add_space(10.0);
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new(format!("Tube Inspector: Tube {}", tube_id)).strong());
-                        
-                        let mut temp_tube = tubes[tube_id].clone();
-                        let mut geom_changed = false;
-                        let mut name_changed = false;
-                        
-                        ui.horizontal(|ui| {
-                            ui.label("Name:");
-                            if ui.text_edit_singleline(&mut temp_tube.name).changed() {
-                                name_changed = true;
-                            }
-                        });
-                        
-                        let mut cells = temp_tube.num_cells;
-                        if ui.add(egui::Slider::new(&mut cells, 5..=100).text("CFD Cells")).changed() {
-                            temp_tube.num_cells = cells;
-                            geom_changed = true;
+                    if ui.add(egui::Slider::new(&mut self.hp_cutoff_input, 1.0..=5000.0)
+                        .text("HP Cutoff")
+                        .suffix(" Hz")
+                        .logarithmic(true)
+                    ).changed() {
+                        if let Ok(mut fp) = self.filter_params.lock() {
+                            fp.hp_cutoff_hz = self.hp_cutoff_input;
                         }
+                    }
+                });
 
-                        let mut r_start = temp_tube.r_start;
-                        if ui.add(egui::Slider::new(&mut r_start, 0.005..=0.08).text("Start Radius").suffix(" m")).changed() {
-                            temp_tube.r_start = r_start;
-                            geom_changed = true;
-                        }
-
-                        let mut r_end = temp_tube.r_end;
-                        if ui.add(egui::Slider::new(&mut r_end, 0.005..=0.08).text("End Radius").suffix(" m")).changed() {
-                            temp_tube.r_end = r_end;
-                            geom_changed = true;
-                        }
-
-                        // Boundary Conditions edits (only if not connected to a junction)
-                        let connected_left = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube_id && c.side == TubeSide::Left));
-                        let connected_right = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube_id && c.side == TubeSide::Right));
-
-                        if !connected_left {
+                // Geometry editor panel for selected tube
+                if let Some(tube_id) = self.selected_tube_id {
+                    if tube_id < tubes.len() {
+                        ui.add_space(10.0);
+                        ui.group(|ui| {
+                            ui.label(egui::RichText::new(format!("Tube Inspector: Tube {}", tube_id)).strong());
+                            
+                            let mut temp_tube = tubes[tube_id].clone();
+                            let mut geom_changed = false;
+                            let mut name_changed = false;
+                            
                             ui.horizontal(|ui| {
-                                ui.label("Left BC:");
-                                let mut left_type = match temp_tube.left_bc {
-                                    BoundaryType::Closed => 0,
-                                    BoundaryType::Open => 1,
-                                    BoundaryType::Valve { .. } => 2,
-                                };
-                                let old_type = left_type;
-                                egui::ComboBox::from_id_source("left_bc_combo")
-                                    .selected_text(match left_type {
-                                        0 => "Closed",
-                                        1 => "Open",
-                                        _ => "Valve",
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut left_type, 0, "Closed");
-                                        ui.selectable_value(&mut left_type, 1, "Open");
-                                        ui.selectable_value(&mut left_type, 2, "Valve");
-                                    });
-                                if left_type != old_type {
-                                    temp_tube.left_bc = match left_type {
-                                        0 => BoundaryType::Closed,
-                                        1 => BoundaryType::Open,
-                                        _ => BoundaryType::Valve { lift: 1.0 },
-                                    };
-                                    geom_changed = true;
+                                ui.label("Name:");
+                                if ui.text_edit_singleline(&mut temp_tube.name).changed() {
+                                    name_changed = true;
                                 }
                             });
-                            if let BoundaryType::Valve { mut lift } = temp_tube.left_bc {
-                                if ui.add(egui::Slider::new(&mut lift, 0.0..=1.0).text("Left Valve Lift")).changed() {
-                                    temp_tube.left_bc = BoundaryType::Valve { lift };
-                                    let mut state = self.shared_state.lock().unwrap();
-                                    state.tubes[tube_id].left_bc = BoundaryType::Valve { lift };
-                                }
-                            }
-                        } else {
-                            ui.label(egui::RichText::new("Left end connects to Junction").weak().size(11.0));
-                        }
-
-                        if !connected_right {
-                            ui.horizontal(|ui| {
-                                ui.label("Right BC:");
-                                let mut right_type = match temp_tube.right_bc {
-                                    BoundaryType::Closed => 0,
-                                    BoundaryType::Open => 1,
-                                    BoundaryType::Valve { .. } => 2,
-                                };
-                                let old_type = right_type;
-                                egui::ComboBox::from_id_source("right_bc_combo")
-                                    .selected_text(match right_type {
-                                        0 => "Closed",
-                                        1 => "Open",
-                                        _ => "Valve",
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut right_type, 0, "Closed");
-                                        ui.selectable_value(&mut right_type, 1, "Open");
-                                        ui.selectable_value(&mut right_type, 2, "Valve");
-                                    });
-                                if right_type != old_type {
-                                    temp_tube.right_bc = match right_type {
-                                        0 => BoundaryType::Closed,
-                                        1 => BoundaryType::Open,
-                                        _ => BoundaryType::Valve { lift: 1.0 },
-                                    };
-                                    geom_changed = true;
-                                }
-                            });
-                            if let BoundaryType::Valve { mut lift } = temp_tube.right_bc {
-                                if ui.add(egui::Slider::new(&mut lift, 0.0..=1.0).text("Right Valve Lift")).changed() {
-                                    temp_tube.right_bc = BoundaryType::Valve { lift };
-                                    let mut state = self.shared_state.lock().unwrap();
-                                    state.tubes[tube_id].right_bc = BoundaryType::Valve { lift };
-                                }
-                            }
-                        } else {
-                            ui.label(egui::RichText::new("Right end connects to Junction").weak().size(11.0));
-                        }
-                        
-                        if temp_tube.radius_profile == RadiusProfile::ExpansionChamber {
-                            let mut r_mid = temp_tube.r_mid;
-                            if ui.add(egui::Slider::new(&mut r_mid, 0.01..=0.12).text("Chamber Radius").suffix(" m")).changed() {
-                                temp_tube.r_mid = r_mid;
+                            
+                            let mut cells = temp_tube.num_cells;
+                            if ui.add(egui::Slider::new(&mut cells, 5..=100).text("CFD Cells")).changed() {
+                                temp_tube.num_cells = cells;
                                 geom_changed = true;
                             }
-                        }
 
-                        if geom_changed || name_changed {
-                            let mut state = self.shared_state.lock().unwrap();
-                            state.tubes[tube_id] = temp_tube;
-                            if geom_changed {
-                                state.tubes[tube_id].rebuild_geometry();
-                                state.reset_trigger = true;
+                            let mut r_start = temp_tube.r_start;
+                            if ui.add(egui::Slider::new(&mut r_start, 0.005..=0.08).text("Start Radius").suffix(" m")).changed() {
+                                temp_tube.r_start = r_start;
+                                geom_changed = true;
+                            }
+
+                            let mut r_end = temp_tube.r_end;
+                            if ui.add(egui::Slider::new(&mut r_end, 0.005..=0.08).text("End Radius").suffix(" m")).changed() {
+                                temp_tube.r_end = r_end;
+                                geom_changed = true;
+                            }
+
+                            // Boundary Conditions edits (only if not connected to a junction)
+                            let connected_left = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube_id && c.side == TubeSide::Left));
+                            let connected_right = junctions.iter().any(|j| j.connections.iter().any(|c| c.tube_id == tube_id && c.side == TubeSide::Right));
+
+                            if !connected_left {
+                                ui.horizontal(|ui| {
+                                    ui.label("Left BC:");
+                                    let mut left_type = match temp_tube.left_bc {
+                                        BoundaryType::Closed => 0,
+                                        BoundaryType::Open => 1,
+                                        BoundaryType::Valve { .. } => 2,
+                                    };
+                                    let old_type = left_type;
+                                    egui::ComboBox::from_id_source("left_bc_combo")
+                                        .selected_text(match left_type {
+                                            0 => "Closed",
+                                            1 => "Open",
+                                            _ => "Valve",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut left_type, 0, "Closed");
+                                            ui.selectable_value(&mut left_type, 1, "Open");
+                                            ui.selectable_value(&mut left_type, 2, "Valve");
+                                        });
+                                    if left_type != old_type {
+                                        temp_tube.left_bc = match left_type {
+                                            0 => BoundaryType::Closed,
+                                            1 => BoundaryType::Open,
+                                            _ => BoundaryType::Valve { lift: 1.0 },
+                                        };
+                                        geom_changed = true;
+                                    }
+                                });
+                                if let BoundaryType::Valve { mut lift } = temp_tube.left_bc {
+                                    if ui.add(egui::Slider::new(&mut lift, 0.0..=1.0).text("Left Valve Lift")).changed() {
+                                        temp_tube.left_bc = BoundaryType::Valve { lift };
+                                        let mut state = self.shared_state.lock().unwrap();
+                                        state.tubes[tube_id].left_bc = BoundaryType::Valve { lift };
+                                    }
+                                }
+                            } else {
+                                ui.label(egui::RichText::new("Left end connects to Junction").weak().size(11.0));
+                            }
+
+                            if !connected_right {
+                                ui.horizontal(|ui| {
+                                    ui.label("Right BC:");
+                                    let mut right_type = match temp_tube.right_bc {
+                                        BoundaryType::Closed => 0,
+                                        BoundaryType::Open => 1,
+                                        BoundaryType::Valve { .. } => 2,
+                                    };
+                                    let old_type = right_type;
+                                    egui::ComboBox::from_id_source("right_bc_combo")
+                                        .selected_text(match right_type {
+                                            0 => "Closed",
+                                            1 => "Open",
+                                            _ => "Valve",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut right_type, 0, "Closed");
+                                            ui.selectable_value(&mut right_type, 1, "Open");
+                                            ui.selectable_value(&mut right_type, 2, "Valve");
+                                        });
+                                    if right_type != old_type {
+                                        temp_tube.right_bc = match right_type {
+                                            0 => BoundaryType::Closed,
+                                            1 => BoundaryType::Open,
+                                            _ => BoundaryType::Valve { lift: 1.0 },
+                                        };
+                                        geom_changed = true;
+                                    }
+                                });
+                                if let BoundaryType::Valve { mut lift } = temp_tube.right_bc {
+                                    if ui.add(egui::Slider::new(&mut lift, 0.0..=1.0).text("Right Valve Lift")).changed() {
+                                        temp_tube.right_bc = BoundaryType::Valve { lift };
+                                        let mut state = self.shared_state.lock().unwrap();
+                                        state.tubes[tube_id].right_bc = BoundaryType::Valve { lift };
+                                    }
+                                }
+                            } else {
+                                ui.label(egui::RichText::new("Right end connects to Junction").weak().size(11.0));
+                            }
+                            
+                            if temp_tube.radius_profile == RadiusProfile::ExpansionChamber {
+                                let mut r_mid = temp_tube.r_mid;
+                                if ui.add(egui::Slider::new(&mut r_mid, 0.01..=0.12).text("Chamber Radius").suffix(" m")).changed() {
+                                    temp_tube.r_mid = r_mid;
+                                    geom_changed = true;
+                                }
+                            }
+
+                            if geom_changed || name_changed {
+                                let mut state = self.shared_state.lock().unwrap();
+                                state.tubes[tube_id] = temp_tube;
+                                if geom_changed {
+                                    state.tubes[tube_id].rebuild_geometry();
+                                    state.reset_trigger = true;
+                                }
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(20.0);
+                ui.label(egui::RichText::new("Antigravity - EnGen Project").weak().size(9.0));
+            });
+        });
+
+        // ------------------ Bottom Panel Plots ------------------
+        egui::TopBottomPanel::bottom("bottom_panel")
+            .resizable(true)
+            .default_height(360.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.active_tab, Tab::Pressure, "Pressure graph (Pa)");
+                        ui.selectable_value(&mut self.active_tab, Tab::Velocity, "Velocity graph (m/s)");
+                        ui.selectable_value(&mut self.active_tab, Tab::Density, "Density graph (kg/m³)");
+                        ui.checkbox(&mut self.fixed_scale, "Fixed Y-Scale");
+                    });
+
+                    ui.add_space(5.0);
+
+                    // Fetch selected tube to graph
+                    if let Some(tube_id) = self.selected_tube_id {
+                        if let Some(tube) = tubes.iter().find(|t| t.id == tube_id) {
+                            let m = tube.num_cells;
+                            let dx = tube.dx;
+                            let gamma = 1.4;
+
+                            match self.active_tab {
+                                Tab::Pressure => {
+                                    let points: PlotPoints = tube.u[1..=m]
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, u_cell)| {
+                                            let p = u_cell[2] * (gamma - 1.0) - 0.5 * (u_cell[1] * u_cell[1]) / u_cell[0].max(1e-5);
+                                            [((i as f32 + 0.5) * dx) as f64, p as f64]
+                                        })
+                                        .collect();
+
+                                    let line = Line::new(points).color(egui::Color32::from_rgb(0, 180, 255)).width(2.0);
+                                    let mut plot = Plot::new("pressure_plot").height(150.0).x_axis_label("Position along tube (m)").show_grid(true);
+                                    if self.fixed_scale {
+                                        plot = plot.include_y(P_ATM - 25000.0).include_y(P_ATM + 25000.0);
+                                    }
+                                    plot.show(ui, |plot_ui| {
+                                        plot_ui.hline(HLine::new(P_ATM as f64).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
+                                        plot_ui.line(line);
+                                    });
+                                }
+                                Tab::Velocity => {
+                                    let points: PlotPoints = tube.u[1..=m]
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, u_cell)| {
+                                            let v = u_cell[1] / u_cell[0].max(1e-5);
+                                            [((i as f32 + 0.5) * dx) as f64, v as f64]
+                                        })
+                                        .collect();
+
+                                    let line = Line::new(points).color(egui::Color32::from_rgb(255, 150, 0)).width(2.0);
+                                    let mut plot = Plot::new("velocity_plot").height(150.0).x_axis_label("Position along tube (m)").show_grid(true);
+                                    if self.fixed_scale {
+                                        plot = plot.include_y(-100.0).include_y(100.0);
+                                    }
+                                    plot.show(ui, |plot_ui| {
+                                        plot_ui.hline(HLine::new(0.0).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
+                                        plot_ui.line(line);
+                                    });
+                                }
+                                Tab::Density => {
+                                    let points: PlotPoints = tube.u[1..=m]
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, u_cell)| {
+                                            [((i as f32 + 0.5) * dx) as f64, u_cell[0] as f64]
+                                        })
+                                        .collect();
+
+                                    let line = Line::new(points).color(egui::Color32::from_rgb(50, 205, 50)).width(2.0);
+                                    let mut plot = Plot::new("density_plot").height(150.0).x_axis_label("Position along tube (m)").show_grid(true);
+                                    if self.fixed_scale {
+                                        plot = plot.include_y(RHO_ATM - 0.3).include_y(RHO_ATM + 0.3);
+                                    }
+                                    plot.show(ui, |plot_ui| {
+                                        plot_ui.hline(HLine::new(RHO_ATM as f64).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
+                                        plot_ui.line(line);
+                                    });
+                                }
                             }
                         }
-                    });
-                }
-            }
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Click on any tube in the layout viewport to plot its values.");
+                        });
+                    }
 
-            ui.add_space(20.0);
-            ui.label(egui::RichText::new("Antigravity - EnGen Project").weak().size(9.0));
-        });
+                    ui.add_space(5.0);
+                    ui.separator();
+                    ui.add_space(5.0);
+                    ui.label(egui::RichText::new("Jones Audio Outlet Radiation Signal (dP/dt)").strong());
+
+                    let jones_history = {
+                        let state = self.shared_state.lock().unwrap();
+                        state.jones_history.clone()
+                    };
+
+                    let points: PlotPoints = jones_history
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &val)| [i as f64, val as f64])
+                        .collect();
+
+                    let line = Line::new(points).color(egui::Color32::from_rgb(255, 105, 180)).width(1.5);
+                    let plot = Plot::new("jones_plot")
+                        .height(100.0)
+                        .show_grid(true)
+                        .include_y(-1000.0)
+                        .include_y(1000.0);
+                    plot.show(ui, |plot_ui| {
+                        plot_ui.hline(HLine::new(0.0).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
+                        plot_ui.line(line);
+                    });
+                });
+            });
 
         // ------------------ Central Canvas / Viewport ------------------
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -694,7 +830,7 @@ impl eframe::App for EngenApp {
                 
                 // Allocate painter for 2D graphics
                 let (response, painter) = ui.allocate_painter(
-                    egui::vec2(ui.available_width(), ui.available_height() - 250.0), // leaves space for bottom graph
+                    ui.available_size(),
                     egui::Sense::click_and_drag(),
                 );
 
@@ -993,118 +1129,6 @@ impl eframe::App for EngenApp {
                     painter.circle_filled(screen_pos, 6.0, egui::Color32::from_rgb(255, 215, 0));
                     painter.circle_stroke(screen_pos, 6.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
                 }
-            });
-
-            // ------------------ Bottom Plots ------------------
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.active_tab, Tab::Pressure, "Pressure graph (Pa)");
-                ui.selectable_value(&mut self.active_tab, Tab::Velocity, "Velocity graph (m/s)");
-                ui.selectable_value(&mut self.active_tab, Tab::Density, "Density graph (kg/m³)");
-                ui.checkbox(&mut self.fixed_scale, "Fixed Y-Scale");
-            });
-
-            ui.add_space(5.0);
-
-            // Fetch selected tube to graph
-            if let Some(tube_id) = self.selected_tube_id {
-                if let Some(tube) = tubes.iter().find(|t| t.id == tube_id) {
-                    let m = tube.num_cells;
-                    let dx = tube.dx;
-                    let gamma = 1.4;
-
-                    match self.active_tab {
-                        Tab::Pressure => {
-                            let points: PlotPoints = tube.u[1..=m]
-                                .iter()
-                                .enumerate()
-                                .map(|(i, u_cell)| {
-                                    let p = u_cell[2] * (gamma - 1.0) - 0.5 * (u_cell[1] * u_cell[1]) / u_cell[0].max(1e-5);
-                                    [((i as f32 + 0.5) * dx) as f64, p as f64]
-                                })
-                                .collect();
-
-                            let line = Line::new(points).color(egui::Color32::from_rgb(0, 180, 255)).width(2.0);
-                            let mut plot = Plot::new("pressure_plot").height(150.0).x_axis_label("Position along tube (m)").show_grid(true);
-                            if self.fixed_scale {
-                                plot = plot.include_y(P_ATM - 25000.0).include_y(P_ATM + 25000.0);
-                            }
-                            plot.show(ui, |plot_ui| {
-                                plot_ui.hline(HLine::new(P_ATM as f64).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
-                                plot_ui.line(line);
-                            });
-                        }
-                        Tab::Velocity => {
-                            let points: PlotPoints = tube.u[1..=m]
-                                .iter()
-                                .enumerate()
-                                .map(|(i, u_cell)| {
-                                    let v = u_cell[1] / u_cell[0].max(1e-5);
-                                    [((i as f32 + 0.5) * dx) as f64, v as f64]
-                                })
-                                .collect();
-
-                            let line = Line::new(points).color(egui::Color32::from_rgb(255, 150, 0)).width(2.0);
-                            let mut plot = Plot::new("velocity_plot").height(150.0).x_axis_label("Position along tube (m)").show_grid(true);
-                            if self.fixed_scale {
-                                plot = plot.include_y(-100.0).include_y(100.0);
-                            }
-                            plot.show(ui, |plot_ui| {
-                                plot_ui.hline(HLine::new(0.0).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
-                                plot_ui.line(line);
-                            });
-                        }
-                        Tab::Density => {
-                            let points: PlotPoints = tube.u[1..=m]
-                                .iter()
-                                .enumerate()
-                                .map(|(i, u_cell)| {
-                                    [((i as f32 + 0.5) * dx) as f64, u_cell[0] as f64]
-                                })
-                                .collect();
-
-                            let line = Line::new(points).color(egui::Color32::from_rgb(50, 205, 50)).width(2.0);
-                            let mut plot = Plot::new("density_plot").height(150.0).x_axis_label("Position along tube (m)").show_grid(true);
-                            if self.fixed_scale {
-                                plot = plot.include_y(RHO_ATM - 0.3).include_y(RHO_ATM + 0.3);
-                            }
-                            plot.show(ui, |plot_ui| {
-                                plot_ui.hline(HLine::new(RHO_ATM as f64).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
-                                plot_ui.line(line);
-                            });
-                        }
-                    }
-                }
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Click on any tube in the layout viewport to plot its values.");
-                });
-            }
-            
-            ui.add_space(5.0);
-            ui.separator();
-            ui.add_space(5.0);
-            ui.label(egui::RichText::new("Jones Audio Outlet Radiation Signal (dP/dt)").strong());
-            
-            let jones_history = {
-                let state = self.shared_state.lock().unwrap();
-                state.jones_history.clone()
-            };
-            
-            let points: PlotPoints = jones_history
-                .iter()
-                .enumerate()
-                .map(|(i, &val)| [i as f64, val as f64])
-                .collect();
-            
-            let line = Line::new(points).color(egui::Color32::from_rgb(255, 105, 180)).width(1.5);
-            let plot = Plot::new("jones_plot")
-                .height(100.0)
-                .show_grid(true)
-                .include_y(-1000.0)
-                .include_y(1000.0);
-            plot.show(ui, |plot_ui| {
-                plot_ui.hline(HLine::new(0.0).color(egui::Color32::GRAY).style(egui_plot::LineStyle::Dashed { length: 6.0 }));
-                plot_ui.line(line);
             });
         });
     }
