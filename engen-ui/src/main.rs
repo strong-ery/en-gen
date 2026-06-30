@@ -117,6 +117,13 @@ struct SharedState {
     pub ecu_iac_lift: f32,
     pub ecu_is_cranking: bool,
     pub ecu_rev_limiter_active: bool,
+
+    // Species & Misfires Telemetry
+    pub cylinder_afr: f32,
+    pub cylinder_lambda: f32,
+    pub residual_fraction: f32,
+    pub last_misfire: bool,
+    pub misfire_count: u32,
 }
 
 fn spawn_solver_thread(
@@ -291,6 +298,12 @@ fn spawn_solver_thread(
                     state.ecu_is_cranking = solver.ecu.is_cranking;
                     state.ecu_rev_limiter_active = solver.ecu.rev_limiter_active;
                     
+                    state.cylinder_afr = solver.last_cylinder_afr;
+                    state.cylinder_lambda = solver.last_cylinder_lambda;
+                    state.residual_fraction = solver.last_residual_fraction;
+                    state.last_misfire = solver.last_misfire;
+                    state.misfire_count = solver.misfire_count;
+                    
                     // Sync starter disengagement
                     if !solver.starter_active && state.starter_engaged {
                         state.starter_engaged = false;
@@ -413,6 +426,12 @@ fn spawn_solver_thread(
                         state.ecu_rev_limiter_active = solver.ecu.rev_limiter_active;
                         state.ignition_timing_deg = solver.ignition_timing_deg;
                         state.target_afr = solver.target_afr;
+                        
+                        state.cylinder_afr = solver.last_cylinder_afr;
+                        state.cylinder_lambda = solver.last_cylinder_lambda;
+                        state.residual_fraction = solver.last_residual_fraction;
+                        state.last_misfire = solver.last_misfire;
+                        state.misfire_count = solver.misfire_count;
 
                         // Sync starter disengagement
                         if !solver.starter_active && state.starter_engaged {
@@ -743,11 +762,21 @@ impl eframe::App for EngenApp {
                             });
                         }
 
-                        let (ecu_map_pa, ecu_iac_lift, ecu_is_cranking, ecu_rev_limiter_active) = {
+                        let (ecu_map_pa, ecu_iac_lift, ecu_is_cranking, ecu_rev_limiter_active, cyl_afr, cyl_lambda, res_frac, last_misfire, misfire_cnt) = {
                             if let Ok(state) = self.shared_state.lock() {
-                                (state.ecu_map_pa, state.ecu_iac_lift, state.ecu_is_cranking, state.ecu_rev_limiter_active)
+                                (
+                                    state.ecu_map_pa,
+                                    state.ecu_iac_lift,
+                                    state.ecu_is_cranking,
+                                    state.ecu_rev_limiter_active,
+                                    state.cylinder_afr,
+                                    state.cylinder_lambda,
+                                    state.residual_fraction,
+                                    state.last_misfire,
+                                    state.misfire_count,
+                                )
                             } else {
-                                (101325.0, 0.0, true, false)
+                                (101325.0, 0.0, true, false, 14.7, 1.0, 0.0, false, 0)
                             }
                         };
 
@@ -770,6 +799,32 @@ impl eframe::App for EngenApp {
                             ui.horizontal(|ui| {
                                 ui.label("IAC Valve Lift:");
                                 ui.label(format!("{:.1}%", (ecu_iac_lift * 100.0 / 0.015) as f64));
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("In-Cylinder AFR:");
+                                let afr_color = if last_misfire {
+                                    egui::Color32::RED
+                                } else if (cyl_afr - 14.7).abs() < 1.0 {
+                                    egui::Color32::GREEN
+                                } else {
+                                    egui::Color32::YELLOW
+                                };
+                                ui.label(egui::RichText::new(format!("{:.1} (λ={:.2})", cyl_afr as f64, cyl_lambda as f64)).color(afr_color));
+                            });
+                            
+                            ui.horizontal(|ui| {
+                                ui.label("Residual Exhaust:");
+                                ui.label(format!("{:.1}%", (res_frac * 100.0) as f64));
+                            });
+                            
+                            ui.horizontal(|ui| {
+                                ui.label("Misfires:");
+                                if last_misfire {
+                                    ui.label(egui::RichText::new(format!("{} (💥 MISFIRE)", misfire_cnt)).color(egui::Color32::RED).strong());
+                                } else {
+                                    ui.label(format!("{}", misfire_cnt));
+                                }
                             });
 
                             if ecu_rev_limiter_active {
@@ -1760,6 +1815,11 @@ fn main() -> eframe::Result<()> {
         ecu_iac_lift: 0.0,
         ecu_is_cranking: true,
         ecu_rev_limiter_active: false,
+        cylinder_afr: 14.7,
+        cylinder_lambda: 1.0,
+        residual_fraction: 0.0,
+        last_misfire: false,
+        misfire_count: 0,
     }));
     
     let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state), Arc::clone(&audio_buffer), Arc::clone(&filter_params));

@@ -90,6 +90,7 @@ pub struct Ecu {
     // Calibration parameters
     pub target_idle_rpm: f32,
     pub redline_rpm: f32,
+    pub manual_afr_control: bool,
 }
 
 impl Default for Ecu {
@@ -109,6 +110,7 @@ impl Default for Ecu {
             iac_pid: PidController::new(0.00005, 0.00002, 0.000005),
             target_idle_rpm: 2800.0,
             redline_rpm: 13000.0,
+            manual_afr_control: false,
         }
     }
 }
@@ -173,18 +175,20 @@ impl Ecu {
         }
 
         // --- Target AFR Map ---
-        if self.is_cranking {
-            // Rich AFR for cold starting/cranking
-            self.target_afr = 11.5;
-        } else {
-            // Base stoichiometric, slightly rich under high load (high MAP), lean at low load
-            let map_kpa = self.map_pa / 1000.0;
-            if map_kpa > 85.0 {
-                self.target_afr = 12.8; // Rich at wide-open-throttle
-            } else if map_kpa < 30.0 {
-                self.target_afr = 15.5; // Lean on overrun / high vacuum
+        if !self.manual_afr_control {
+            if self.is_cranking {
+                // Rich AFR for cold starting/cranking
+                self.target_afr = 11.5;
             } else {
-                self.target_afr = 14.7; // Perfect stoichiometric
+                // Base stoichiometric, slightly rich under high load (high MAP), lean at low load
+                let map_kpa = self.map_pa / 1000.0;
+                if map_kpa > 85.0 {
+                    self.target_afr = 12.8; // Rich at wide-open-throttle
+                } else if map_kpa < 30.0 {
+                    self.target_afr = 15.5; // Lean on overrun / high vacuum
+                } else {
+                    self.target_afr = 14.7; // Perfect stoichiometric
+                }
             }
         }
 

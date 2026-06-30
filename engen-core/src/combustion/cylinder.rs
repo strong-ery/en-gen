@@ -1,4 +1,5 @@
 use crate::cfd::solver::{TubeSide, P_ATM, RHO_ATM, R_AIR};
+use crate::cfd::species::{AIR_Y, NUM_SPECIES};
 use crate::mechanical::valve::ValveType;
 use crate::mechanical::crankshaft::piston_displacement;
 
@@ -38,6 +39,12 @@ pub struct Cylinder {
     pub rho_temp: f32,
     pub p_temp: f32,
     
+    // Species Tracking
+    pub species: [f32; NUM_SPECIES],
+    pub species_temp: [f32; NUM_SPECIES],
+    pub residual_fraction: f32,
+    pub initial_fuel_fraction: f32,
+    
     // Valve and manifold coupling connections
     pub connections: Vec<CylinderConnection>,
     pub combustion_phase: f32,
@@ -75,6 +82,10 @@ impl Cylinder {
             energy_temp: 0.0,
             rho_temp: RHO_ATM,
             p_temp: P_ATM,
+            species: AIR_Y,
+            species_temp: AIR_Y,
+            residual_fraction: 0.0,
+            initial_fuel_fraction: 0.0,
             connections,
             combustion_phase: -1.0,
         };
@@ -101,6 +112,10 @@ impl Cylinder {
         self.energy_temp = self.energy;
         self.rho_temp = self.rho;
         self.p_temp = self.p;
+        self.species = AIR_Y;
+        self.species_temp = AIR_Y;
+        self.residual_fraction = 0.0;
+        self.initial_fuel_fraction = 0.0;
         self.combustion_phase = -1.0;
     }
 

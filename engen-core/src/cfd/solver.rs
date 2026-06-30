@@ -77,7 +77,11 @@ pub struct Junction {
     pub rho: f32,
     pub e: f32,
     pub volume: f32,
+    pub species: [f32; 4],
+    pub species_temp: [f32; 4],
 }
+
+use crate::cfd::species::AIR_Y;
 
 #[derive(Debug, Clone)]
 pub struct Tube {
@@ -114,12 +118,19 @@ pub struct Tube {
     pub left_last_mass_flow: f32,
     pub right_last_mass_flow: f32,
     
+    // Species Tracking
+    pub species: Vec<[f32; 4]>,
+    pub species_temp: Vec<[f32; 4]>,
+    pub left_species_flux: [f32; 4],
+    pub right_species_flux: [f32; 4],
+    
     // Pre-allocated temporary workspaces for solver to avoid heap allocations in hot path
     pub u_temp: Vec<[f32; 3]>,
     pub w: Vec<[f32; 3]>,
     pub slopes: Vec<[f32; 3]>,
     pub fluxes: Vec<[f32; 3]>,
     pub rhs: Vec<[f32; 3]>,
+    pub species_rhs: Vec<[f32; 4]>,
     
     // Pre-calculated 2D graphics vectors for rendering the heatmap layout
     pub cell_centers_2d: Vec<[f32; 2]>,
@@ -168,11 +179,16 @@ impl Tube {
             right_last_r_out: atmospheric_r_minus(1.4),
             left_last_mass_flow: 0.0,
             right_last_mass_flow: 0.0,
+            species: Vec::new(),
+            species_temp: Vec::new(),
+            left_species_flux: [0.0; 4],
+            right_species_flux: [0.0; 4],
             u_temp: Vec::new(),
             w: Vec::new(),
             slopes: Vec::new(),
             fluxes: Vec::new(),
             rhs: Vec::new(),
+            species_rhs: Vec::new(),
             cell_centers_2d: Vec::new(),
             cell_tangents_2d: Vec::new(),
             cell_boundaries_left_2d: Vec::new(),
@@ -199,12 +215,18 @@ impl Tube {
         self.left_last_mass_flow = 0.0;
         self.right_last_mass_flow = 0.0;
         
+        self.species = vec![AIR_Y; self.num_cells + 2];
+        self.species_temp = vec![AIR_Y; self.num_cells + 2];
+        self.left_species_flux = [0.0; 4];
+        self.right_species_flux = [0.0; 4];
+        
         // Reset temporary workspaces
         for x in &mut self.u_temp { *x = [0.0; 3]; }
         for x in &mut self.w { *x = [0.0; 3]; }
         for x in &mut self.slopes { *x = [0.0; 3]; }
         for x in &mut self.fluxes { *x = [0.0; 3]; }
         for x in &mut self.rhs { *x = [0.0; 3]; }
+        for x in &mut self.species_rhs { *x = [0.0; 4]; }
     }
 
     pub fn get_radius_at(&self, t: f32) -> f32 {
@@ -238,6 +260,9 @@ impl Tube {
         self.slopes = vec![[0.0; 3]; m + 2];
         self.fluxes = vec![[0.0; 3]; m + 1];
         self.rhs = vec![[0.0; 3]; m + 2];
+        self.species = vec![AIR_Y; m + 2];
+        self.species_temp = vec![AIR_Y; m + 2];
+        self.species_rhs = vec![[0.0; 4]; m + 2];
         
         self.cell_centers_2d = vec![[0.0; 2]; m + 1];
         self.cell_tangents_2d = vec![[0.0; 2]; m + 1];
@@ -374,6 +399,14 @@ pub struct Solver {
     pub throttle_input: f32,
     pub starter_active: bool,
     pub ecu: Ecu,
+    
+    // Telemetry for species & misfires
+    pub last_cylinder_afr: f32,
+    pub last_cylinder_lambda: f32,
+    pub last_residual_fraction: f32,
+    pub last_misfire: bool,
+    pub misfire_count: u32,
+    pub misfire_model: crate::combustion::MisfireModel,
 }
 
 impl Solver {
@@ -412,6 +445,12 @@ impl Solver {
             throttle_input: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
+            last_cylinder_afr: 14.7,
+            last_cylinder_lambda: 1.0,
+            last_residual_fraction: 0.0,
+            last_misfire: false,
+            misfire_count: 0,
+            misfire_model: crate::combustion::MisfireModel::new(),
         }
     }
 
@@ -484,6 +523,8 @@ impl Solver {
             rho: RHO_ATM,
             e: P_ATM / (1.4 - 1.0),
             volume: vol,
+            species: AIR_Y,
+            species_temp: AIR_Y,
         };
 
         Self {
@@ -504,6 +545,12 @@ impl Solver {
             throttle_input: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
+            last_cylinder_afr: 14.7,
+            last_cylinder_lambda: 1.0,
+            last_residual_fraction: 0.0,
+            last_misfire: false,
+            misfire_count: 0,
+            misfire_model: crate::combustion::MisfireModel::new(),
         }
     }
 
@@ -584,6 +631,12 @@ impl Solver {
             throttle_input: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
+            last_cylinder_afr: 14.7,
+            last_cylinder_lambda: 1.0,
+            last_residual_fraction: 0.0,
+            last_misfire: false,
+            misfire_count: 0,
+            misfire_model: crate::combustion::MisfireModel::new(),
         }
     }
 
@@ -766,6 +819,34 @@ impl Solver {
                 cyl.delta_vol = v_new - v_old;
             }
 
+            // Fuel Injection Model
+            if !self.ecu.fuel_cut {
+                for cyl in &self.cylinders {
+                    for conn in &cyl.connections {
+                        if conn.valve_type == ValveType::Intake {
+                            let (open_a, close_a) = (350.0f32.to_radians(), 570.0f32.to_radians());
+                            let lift = get_valve_lift(crank.theta, open_a, close_a);
+                            if lift > 0.0 {
+                                let tube = &mut self.tubes[conn.tube_id];
+                                let m = tube.num_cells;
+                                let lambda = self.ecu.target_afr / crate::cfd::species::AFR_STOICH;
+                                let cells_to_inject = if conn.side == TubeSide::Left {
+                                    vec![1, 2, 3]
+                                } else {
+                                    vec![m, m - 1, m - 2]
+                                };
+                                for cell_idx in cells_to_inject {
+                                    let y_o2 = tube.species[cell_idx][crate::cfd::species::I_O2];
+                                    let y_fuel_target = y_o2 / (crate::cfd::species::STOICH_O2_PER_FUEL * lambda);
+                                    tube.species[cell_idx][crate::cfd::species::I_FUEL] = tube.species[cell_idx][crate::cfd::species::I_FUEL].max(y_fuel_target);
+                                    crate::cfd::species::clamp_species(&mut tube.species[cell_idx]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Ignition check and combustion energy release (Wiebe Function Curve)
             for cyl in &mut self.cylinders {
                 if self.ignition_on && !self.ecu.spark_cut {
@@ -776,7 +857,23 @@ impl Solver {
                     let diff_step = (theta_new - theta_old).rem_euclid(4.0 * std::f32::consts::PI);
                     
                     if diff_target < diff_step {
-                        cyl.combustion_phase = 0.0;
+                        let lambda = crate::combustion::burn::lambda_from_species(cyl.species[crate::cfd::species::I_O2], cyl.species[crate::cfd::species::I_FUEL]);
+                        let viable = crate::combustion::burn::combustion_viable(cyl.species[crate::cfd::species::I_O2], cyl.species[crate::cfd::species::I_FUEL], cyl.residual_fraction);
+                        let misfire = self.misfire_model.should_misfire(cyl.residual_fraction, lambda);
+                        
+                        // Sync telemetry fields for interface
+                        self.last_cylinder_afr = crate::combustion::burn::afr_from_lambda(lambda);
+                        self.last_cylinder_lambda = lambda;
+                        self.last_residual_fraction = cyl.residual_fraction;
+                        self.last_misfire = !viable || misfire;
+                        self.misfire_count = self.misfire_model.misfire_count;
+                        
+                        if viable && !misfire {
+                            cyl.combustion_phase = 0.0;
+                            cyl.initial_fuel_fraction = cyl.species[crate::cfd::species::I_FUEL];
+                        } else {
+                            cyl.combustion_phase = -1.0;
+                        }
                     }
                 } else {
                     cyl.combustion_phase = -1.0;
@@ -792,21 +889,24 @@ impl Solver {
                     cyl.combustion_phase = phase_new;
                     
                     // Wiebe parameters: efficiency exponent a=5.0, form factor m=2.0 (so exponent is m+1=3.0)
-                    let xb_old = 1.0 - (-5.0 * (phase_old / comb_duration).powi(3)).exp();
-                    let xb_new = 1.0 - (-5.0 * (phase_new / comb_duration).powi(3)).exp();
+                    let xb_old = crate::combustion::burn::wiebe_fraction(phase_old, comb_duration, 5.0, 3);
+                    let xb_new = crate::combustion::burn::wiebe_fraction(phase_new, comb_duration, 5.0, 3);
                     
                     let d_xb = (xb_new - xb_old).max(0.0);
                     
                     let q_lhv = 44.0e6; // J/kg
-                    let eta = 0.40; // combustion thermal efficiency (realistic)
+                    let lambda = crate::combustion::burn::lambda_from_species(cyl.species[crate::cfd::species::I_O2], cyl.species[crate::cfd::species::I_FUEL]);
+                    let eta = crate::combustion::burn::afr_efficiency(lambda);
                     let cv = R_AIR / (gamma - 1.0);
                     
-                    // Speed-density predicted fuel mass
-                    let v_disp = cyl.piston_area * cyl.stroke;
-                    let m_fuel = self.ecu.get_fuel_mass(v_disp, 293.15);
+                    // Energy release uses the actual fuel mass in the cylinder
+                    let m_fuel = cyl.mass * cyl.initial_fuel_fraction;
                     let delta_u = d_xb * m_fuel * q_lhv * eta;
                     
                     cyl.energy += delta_u;
+                    
+                    // Consume species in the cylinder proportionally to d_xb
+                    crate::combustion::burn::consume_species(&mut cyl.species, d_xb, cyl.initial_fuel_fraction);
                     
                     // Peak temperature cap at 2800 K
                     let max_temp = 2800.0;
@@ -845,6 +945,9 @@ impl Solver {
                 for c in 0..3 {
                     tube.u_temp[i][c] = tube.u[i][c] + dt * tube.rhs[i][c];
                 }
+                for k in 0..4 {
+                    tube.species_temp[i][k] = (tube.species[i][k] + dt * tube.species_rhs[i][k]).clamp(0.0, 1.0);
+                }
             }
         }
 
@@ -852,6 +955,7 @@ impl Solver {
         for (j_idx, junction) in self.junctions.iter().enumerate() {
             let mut dmass = 0.0;
             let mut denergy = 0.0;
+            let mut dmass_species = [0.0f32; 4];
             
             for conn in &junction.connections {
                 let left_flux = step1_left_fluxes[conn.tube_id];
@@ -860,38 +964,70 @@ impl Solver {
                 match conn.side {
                     TubeSide::Left => {
                         let area = tube.area[1];
-                        dmass -= area * left_flux[0];
+                        let flow = -area * left_flux[0];
+                        dmass += flow;
                         denergy -= area * left_flux[2];
+                        for k in 0..4 {
+                            let y_upwind = if flow >= 0.0 { tube.species[1][k] } else { junction.species[k] };
+                            dmass_species[k] += flow * y_upwind;
+                        }
                     }
                     TubeSide::Right => {
                         let area = tube.area[tube.num_cells];
-                        dmass += area * right_flux[0];
+                        let flow = area * right_flux[0];
+                        dmass += flow;
                         denergy += area * right_flux[2];
+                        for k in 0..4 {
+                            let y_upwind = if flow >= 0.0 { tube.species[tube.num_cells][k] } else { junction.species[k] };
+                            dmass_species[k] += flow * y_upwind;
+                        }
                     }
                 }
             }
 
-            j1[j_idx].rho = (junction.rho + (dt / junction.volume) * dmass).max(1e-4);
+            let new_rho = (junction.rho + (dt / junction.volume) * dmass).max(1e-4);
+            j1[j_idx].rho = new_rho;
             j1[j_idx].e = (junction.e + (dt / junction.volume) * denergy).max(1e-2);
+            
+            let junction_mass_old = junction.rho * junction.volume;
+            let junction_mass_new = new_rho * junction.volume;
+            for k in 0..4 {
+                let m_species_old = junction_mass_old * junction.species[k];
+                let m_species_new = (m_species_old + dt * dmass_species[k]).max(0.0);
+                j1[j_idx].species_temp[k] = m_species_new / junction_mass_new.max(1e-6);
+            }
+            crate::cfd::species::clamp_species(&mut j1[j_idx].species_temp);
         }
 
         // Step 1: Update Cylinder Temp States
         for cyl in &mut self.cylinders {
             let mut dmass = 0.0;
             let mut denergy = 0.0;
+            let mut dmass_species = [0.0f32; 4];
+            
             for conn in &cyl.connections {
                 let tube = &self.tubes[conn.tube_id];
                 let area = if conn.side == TubeSide::Left { tube.area[1] } else { tube.area[tube.num_cells] };
                 let flux = if conn.side == TubeSide::Left { step1_left_fluxes[conn.tube_id] } else { step1_right_fluxes[conn.tube_id] };
-                match conn.side {
-                    TubeSide::Left => {
-                        dmass -= area * flux[0];
-                        denergy -= area * flux[2];
-                    }
-                    TubeSide::Right => {
-                        dmass += area * flux[0];
-                        denergy += area * flux[2];
-                    }
+                
+                let flow = match conn.side {
+                    TubeSide::Left => -area * flux[0],
+                    TubeSide::Right => area * flux[0],
+                };
+                dmass += flow;
+                denergy += match conn.side {
+                    TubeSide::Left => -area * flux[2],
+                    TubeSide::Right => area * flux[2],
+                };
+                
+                for k in 0..4 {
+                    let y_upwind = if flow >= 0.0 {
+                        let boundary_cell = if conn.side == TubeSide::Left { 1 } else { tube.num_cells };
+                        tube.species[boundary_cell][k]
+                    } else {
+                        cyl.species[k]
+                    };
+                    dmass_species[k] += flow * y_upwind;
                 }
             }
             
@@ -901,12 +1037,20 @@ impl Solver {
             
             let max_drain_mass = 0.5 * cyl.mass;
             let mass_change = (dt * dmass).max(-max_drain_mass);
-            cyl.mass_temp = (cyl.mass + mass_change).max(1e-6);
+            let cyl_mass_new = (cyl.mass + mass_change).max(1e-6);
+            cyl.mass_temp = cyl_mass_new;
             
             let max_drain_energy = 0.5 * cyl.energy;
             let energy_change = (dt * denergy).max(-max_drain_energy);
             cyl.energy_temp = (cyl.energy * v_ratio + energy_change).max(1e-4);
             cyl.update_thermodynamics_temp(gamma);
+            
+            for k in 0..4 {
+                let m_species_old = cyl.mass * cyl.species[k];
+                let m_species_new = (m_species_old + dt * dmass_species[k]).max(0.0);
+                cyl.species_temp[k] = m_species_new / cyl_mass_new.max(1e-6);
+            }
+            crate::cfd::species::clamp_species(&mut cyl.species_temp);
         }
 
         // ------------------ SSP-RK2 Step 2 ------------------
@@ -937,6 +1081,9 @@ impl Solver {
                 for c in 0..3 {
                     tube.u[i][c] = 0.5 * tube.u[i][c] + 0.5 * tube.u_temp[i][c] + 0.5 * dt * tube.rhs[i][c];
                 }
+                for k in 0..4 {
+                    tube.species[i][k] = (0.5 * tube.species[i][k] + 0.5 * tube.species_temp[i][k] + 0.5 * dt * tube.species_rhs[i][k]).clamp(0.0, 1.0);
+                }
             }
             
             // Safety clamp
@@ -962,6 +1109,7 @@ impl Solver {
         for (j_idx, junction) in self.junctions.iter_mut().enumerate() {
             let mut dmass = 0.0;
             let mut denergy = 0.0;
+            let mut dmass_species = [0.0f32; 4];
             
             for conn in &junction.connections {
                 let left_flux = step2_left_fluxes[conn.tube_id];
@@ -970,38 +1118,72 @@ impl Solver {
                 match conn.side {
                     TubeSide::Left => {
                         let area = tube.area[1];
-                        dmass -= area * left_flux[0];
+                        let flow = -area * left_flux[0];
+                        dmass += flow;
                         denergy -= area * left_flux[2];
+                        for k in 0..4 {
+                            let y_upwind = if flow >= 0.0 { tube.species_temp[1][k] } else { j1[j_idx].species_temp[k] };
+                            dmass_species[k] += flow * y_upwind;
+                        }
                     }
                     TubeSide::Right => {
                         let area = tube.area[tube.num_cells];
-                        dmass += area * right_flux[0];
+                        let flow = area * right_flux[0];
+                        dmass += flow;
                         denergy += area * right_flux[2];
+                        for k in 0..4 {
+                            let y_upwind = if flow >= 0.0 { tube.species_temp[tube.num_cells][k] } else { j1[j_idx].species_temp[k] };
+                            dmass_species[k] += flow * y_upwind;
+                        }
                     }
                 }
             }
 
-            junction.rho = (0.5 * junction.rho + 0.5 * j1[j_idx].rho + 0.5 * (dt / junction.volume) * dmass).max(1e-4);
+            let new_rho = (0.5 * junction.rho + 0.5 * j1[j_idx].rho + 0.5 * (dt / junction.volume) * dmass).max(1e-4);
+            junction.rho = new_rho;
             junction.e = (0.5 * junction.e + 0.5 * j1[j_idx].e + 0.5 * (dt / junction.volume) * denergy).max(1e-2);
+            
+            let junction_mass = new_rho * junction.volume;
+            let junction_mass_old = junction.rho * junction.volume;
+            let junction_mass_temp = j1[j_idx].rho * junction.volume;
+            for k in 0..4 {
+                let m_species_old = junction_mass_old * junction.species[k];
+                let m_species_temp = junction_mass_temp * j1[j_idx].species_temp[k];
+                let m_species_new = (0.5 * m_species_old + 0.5 * m_species_temp + 0.5 * dt * dmass_species[k]).max(0.0);
+                junction.species[k] = m_species_new / junction_mass.max(1e-6);
+            }
+            crate::cfd::species::clamp_species(&mut junction.species);
         }
 
         // Step 2: Update Cylinder Final States
         for cyl in &mut self.cylinders {
             let mut dmass = 0.0;
             let mut denergy = 0.0;
+            let mut dmass_species = [0.0f32; 4];
+            
             for conn in &cyl.connections {
                 let tube = &self.tubes[conn.tube_id];
                 let area = if conn.side == TubeSide::Left { tube.area[1] } else { tube.area[tube.num_cells] };
                 let flux = if conn.side == TubeSide::Left { step2_left_fluxes[conn.tube_id] } else { step2_right_fluxes[conn.tube_id] };
-                match conn.side {
-                    TubeSide::Left => {
-                        dmass -= area * flux[0];
-                        denergy -= area * flux[2];
-                    }
-                    TubeSide::Right => {
-                        dmass += area * flux[0];
-                        denergy += area * flux[2];
-                    }
+                
+                let flow = match conn.side {
+                    TubeSide::Left => -area * flux[0],
+                    TubeSide::Right => area * flux[0],
+                };
+                dmass += flow;
+                denergy += match conn.side {
+                    TubeSide::Left => -area * flux[2],
+                    TubeSide::Right => area * flux[2],
+                };
+                
+                for k in 0..4 {
+                    let y_upwind = if flow >= 0.0 {
+                        let boundary_cell = if conn.side == TubeSide::Left { 1 } else { tube.num_cells };
+                        tube.species_temp[boundary_cell][k]
+                    } else {
+                        cyl.species_temp[k]
+                    };
+                    dmass_species[k] += flow * y_upwind;
                 }
             }
             
@@ -1011,12 +1193,26 @@ impl Solver {
             
             let max_drain_mass = 0.5 * cyl.mass;
             let mass_change = (0.5 * dt * dmass).max(-max_drain_mass);
-            cyl.mass = (0.5 * cyl.mass + 0.5 * cyl.mass_temp + mass_change).max(1e-6);
+            let cyl_mass_new = (0.5 * cyl.mass + 0.5 * cyl.mass_temp + mass_change).max(1e-6);
+            cyl.mass = cyl_mass_new;
             
             let max_drain_energy = 0.5 * cyl.energy;
             let energy_change = (0.5 * dt * denergy).max(-max_drain_energy);
             cyl.energy = (0.5 * cyl.energy * v_ratio + 0.5 * cyl.energy_temp + energy_change).max(1e-4);
             cyl.update_thermodynamics(gamma);
+            
+            let cyl_mass_old = cyl.mass;
+            let cyl_mass_temp = cyl.mass_temp;
+            for k in 0..4 {
+                let m_species_old = cyl_mass_old * cyl.species[k];
+                let m_species_temp = cyl_mass_temp * cyl.species_temp[k];
+                let m_species_new = (0.5 * m_species_old + 0.5 * m_species_temp + 0.5 * dt * dmass_species[k]).max(0.0);
+                cyl.species[k] = m_species_new / cyl_mass_new.max(1e-6);
+            }
+            crate::cfd::species::clamp_species(&mut cyl.species);
+            
+            // Derive residual fraction: Y_CO2 + Y_EXHAUST
+            cyl.residual_fraction = cyl.species[crate::cfd::species::I_CO2] + cyl.species[crate::cfd::species::I_EXHAUST];
         }
 
         self.apply_boundary_conditions();
@@ -1384,6 +1580,9 @@ impl Solver {
                         if let Some(r) = new_r_out {
                             tube.left_last_r_out = r;
                         }
+                        
+                        let species_state = if use_temp { &mut tube.species_temp } else { &mut tube.species };
+                        species_state[0] = if use_temp { cyl.species_temp } else { cyl.species };
                     }
                     TubeSide::Right => {
                         let wm = {
@@ -1431,6 +1630,9 @@ impl Solver {
                         if let Some(r) = new_r_out {
                             tube.right_last_r_out = r;
                         }
+                        
+                        let species_state = if use_temp { &mut tube.species_temp } else { &mut tube.species };
+                        species_state[m + 1] = if use_temp { cyl.species_temp } else { cyl.species };
                     }
                 }
             }
@@ -1516,6 +1718,20 @@ impl Solver {
                 if let Some(r) = new_r_out {
                     tubes[k].left_last_r_out = r;
                 }
+                
+                let species_state = if use_temp { &mut tubes[k].species_temp } else { &mut tubes[k].species };
+                match left_bc {
+                    BoundaryType::Closed => {
+                        species_state[0] = species_state[1];
+                    }
+                    _ => {
+                        if w0[1] >= 0.0 {
+                            species_state[0] = AIR_Y;
+                        } else {
+                            species_state[0] = species_state[1];
+                        }
+                    }
+                }
             }
             
             // 2. Check Right End
@@ -1570,6 +1786,20 @@ impl Solver {
                 if let Some(r) = new_r_out {
                     tubes[k].right_last_r_out = r;
                 }
+                
+                let species_state = if use_temp { &mut tubes[k].species_temp } else { &mut tubes[k].species };
+                match right_bc {
+                    BoundaryType::Closed => {
+                        species_state[m + 1] = species_state[m];
+                    }
+                    _ => {
+                        if w_m1[1] <= 0.0 {
+                            species_state[m + 1] = AIR_Y;
+                        } else {
+                            species_state[m + 1] = species_state[m];
+                        }
+                    }
+                }
             }
         }
         
@@ -1577,22 +1807,26 @@ impl Solver {
         for j in j_states {
             let p_junction = j.e * (gamma - 1.0);
             let rho_junction = j.rho;
+            let species_j = if use_temp { j.species_temp } else { j.species };
             
             for conn in &j.connections {
                 let tube = &mut tubes[conn.tube_id];
                 let num_cells = tube.num_cells;
                 let state = if use_temp { &mut tube.u_temp } else { &mut tube.u };
+                let species_state = if use_temp { &mut tube.species_temp } else { &mut tube.species };
                 
                 match conn.side {
                     TubeSide::Left => {
                         let w1 = conserved_to_primitive(&state[1], gamma);
                         let w0 = [rho_junction, w1[1], p_junction];
                         state[0] = primitive_to_conserved(&w0, gamma);
+                        species_state[0] = species_j;
                     }
                     TubeSide::Right => {
                         let wm = conserved_to_primitive(&state[num_cells], gamma);
                         let w_m1 = [rho_junction, wm[1], p_junction];
                         state[num_cells + 1] = primitive_to_conserved(&w_m1, gamma);
+                        species_state[num_cells + 1] = species_j;
                     }
                 }
             }
@@ -1840,6 +2074,31 @@ impl Solver {
 
                 tube.rhs[i][2] += s_energy_heat;
             }
+        }
+
+        // Species upwind advection
+        let species_state = if use_temp { &tube.species_temp } else { &tube.species };
+        for i in 1..=num_cells {
+            let rho = state[i][0].max(1e-5);
+            let v = state[i][1] / rho;
+            for k in 0..4 {
+                let dy_dx = if v >= 0.0 {
+                    (species_state[i][k] - species_state[i - 1][k]) / dx
+                } else {
+                    (species_state[i + 1][k] - species_state[i][k]) / dx
+                };
+                tube.species_rhs[i][k] = -v * dy_dx;
+            }
+        }
+
+        // Save boundary species fluxes (mass flux * upwind species)
+        let left_mass_flux = tube.fluxes[0][0];
+        let right_mass_flux = tube.fluxes[num_cells][0];
+        let left_upwind = if left_mass_flux >= 0.0 { species_state[0] } else { species_state[1] };
+        let right_upwind = if right_mass_flux >= 0.0 { species_state[num_cells] } else { species_state[num_cells + 1] };
+        for k in 0..4 {
+            tube.left_species_flux[k] = left_mass_flux * left_upwind[k];
+            tube.right_species_flux[k] = right_mass_flux * right_upwind[k];
         }
 
         (left_flux, right_flux)
@@ -2201,6 +2460,120 @@ mod tests {
         // WOT should have significantly higher RPM and MAP than IDLE
         assert!(final_omega_wot > final_omega_idle);
         assert!(final_map_wot > final_map_idle);
+    }
+
+    #[test]
+    fn test_species_advection() {
+        // Create a single tube connected to open atmosphere
+        let mut solver = Solver::new_single_tube(RadiusProfile::Linear, BoundaryType::Open, BoundaryType::Open);
+        let tube = &mut solver.tubes[0];
+        
+        // Initial state is AIR_Y
+        assert_eq!(tube.species[1], AIR_Y);
+        
+        // Set cell 1 to a rich fuel mixture: 10% fuel, 15% O2
+        let rich_mixture = [0.15, 0.10, 0.0, 0.0];
+        tube.species[1] = rich_mixture;
+        
+        // Establish a flow to the right: positive velocity in all cells
+        for i in 1..=tube.num_cells {
+            let mut w = conserved_to_primitive(&tube.u[i], 1.4);
+            w[1] = 50.0; // 50 m/s velocity to the right
+            tube.u[i] = primitive_to_conserved(&w, 1.4);
+        }
+        
+        // Take a few steps of the simulation
+        let sim_dt = 1.0 / 64000.0;
+        for _ in 0..10 {
+            solver.step(sim_dt);
+        }
+        
+        // Verify that species advected to downstream cells (e.g. cell 2 should have non-zero fuel)
+        let tube_after = &solver.tubes[0];
+        assert!(tube_after.species[2][crate::cfd::species::I_FUEL] > 0.0,
+            "Fuel did not advect to cell 2: Y_fuel = {}", tube_after.species[2][crate::cfd::species::I_FUEL]);
+    }
+
+    #[test]
+    fn test_combustion_afr_efficiency() {
+        let mut runs = vec![];
+        
+        // Test three AFR settings: stoichiometric (14.7), extremely rich (6.0), and extremely lean (25.0)
+        for target_afr in [14.7, 6.0, 25.0] {
+            let mut solver = Solver::new_single_cylinder();
+            solver.ignition_on = true;
+            solver.throttle_input = 1.0;
+            solver.ecu.manual_afr_control = true;
+            solver.ecu.target_afr = target_afr;
+            solver.target_afr = target_afr;
+            
+            if let Some(ref mut crank) = solver.crankshaft {
+                crank.omega = 890.0; // start at ~8500 RPM
+            }
+            
+            // Run for 3000 steps
+            let sim_dt = 1.0 / 64000.0;
+            for _ in 0..3000 {
+                solver.step(sim_dt);
+            }
+            
+            let final_omega = solver.crankshaft.as_ref().unwrap().omega;
+            runs.push((target_afr, final_omega));
+        }
+        
+        println!("[AFR TEST OUTPUT] Runs: {:?}", runs);
+        
+        // Stoichiometric (14.7) should produce more power and have higher final omega than rich (6.0) and lean (25.0)
+        let omega_stoich = runs[0].1;
+        let omega_rich = runs[1].1;
+        let omega_lean = runs[2].1;
+        
+        assert!(omega_stoich > omega_rich, "Stoich RPM ({}) should be higher than Rich RPM ({})", omega_stoich, omega_rich);
+        assert!(omega_stoich > omega_lean, "Stoich RPM ({}) should be higher than Lean RPM ({})", omega_stoich, omega_lean);
+    }
+
+    #[test]
+    fn test_misfire_at_high_residual() {
+        let mut solver = Solver::new_single_cylinder();
+        solver.ignition_on = true;
+        
+        // Disconnect the cylinder so advection doesn't wash out the species
+        solver.cylinders[0].connections.clear();
+        
+        // Artificially dilute the cylinder with 70% exhaust products (residual fraction = 0.70)
+        let high_residual = [0.05, 0.05, 0.35, 0.35];
+        solver.cylinders[0].species = high_residual;
+        solver.cylinders[0].residual_fraction = 0.70;
+        
+        // Set combustion phase to trigger spark
+        solver.cylinders[0].combustion_phase = -1.0;
+        let init_energy = solver.cylinders[0].energy;
+        
+        // Advance crankshaft to spark angle (with 5.0 deg timing during cranking) to trigger spark
+        if let Some(ref mut crank) = solver.crankshaft {
+            crank.omega = 100.0; // rotate so that it triggers
+            crank.theta = (4.0 * std::f32::consts::PI - 5.0f32.to_radians()) - 0.005;
+        }
+        
+        // Take multiple steps to cross the spark timing
+        let sim_dt = 1.0 / 64000.0;
+        for i in 0..10 {
+            if let Some(ref crank) = solver.crankshaft {
+                let spark_angle = (4.0 * std::f32::consts::PI - solver.ecu.ignition_timing_deg.to_radians()).rem_euclid(4.0 * std::f32::consts::PI);
+                println!("[STEP {}] crank.theta = {}, spark_angle = {}, timing = {}, viable = {}, last_misfire = {}",
+                    i, crank.theta, spark_angle, solver.ecu.ignition_timing_deg,
+                    crate::combustion::burn::combustion_viable(solver.cylinders[0].species[0], solver.cylinders[0].species[1], solver.cylinders[0].residual_fraction),
+                    solver.last_misfire
+                );
+            }
+            solver.step(sim_dt);
+        }
+        
+        // Verify that a misfire was recorded, and energy change is small (purely compression work, no combustion)
+        assert!(solver.last_misfire, "Engine did not misfire under high residual fraction");
+        assert!(solver.misfire_count >= 1, "Misfire count did not increment");
+        let energy_diff = (solver.cylinders[0].energy - init_energy).abs();
+        assert!(energy_diff < 0.05, "Cylinder energy changed significantly: energy_diff = {}", energy_diff);
     }
 }
 
