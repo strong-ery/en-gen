@@ -154,9 +154,31 @@ pub struct TopologyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransmissionConfig {
+    pub vehicle_mass_kg: f32,
+    pub wheel_radius_m: f32,
+    pub primary_drive_ratio: f32,
+    pub final_drive_ratio: f32,
+    pub gear_ratios: [f32; 6],
+}
+
+impl Default for TransmissionConfig {
+    fn default() -> Self {
+        Self {
+            vehicle_mass_kg: 270.0, // Bike wet weight + rider
+            wheel_radius_m: 0.315,  // 180/55 ZR17
+            primary_drive_ratio: 1.900,
+            final_drive_ratio: 2.867,
+            gear_ratios: [2.846, 2.200, 1.850, 1.600, 1.421, 1.300],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullConfig {
     pub engine: EngineConfig,
     pub ecu: EcuConfig,
+    pub transmission: TransmissionConfig,
     pub topology: Option<TopologyConfig>,
 }
 
@@ -165,6 +187,7 @@ impl Default for FullConfig {
         Self {
             engine: EngineConfig::default(),
             ecu: EcuConfig::default(),
+            transmission: TransmissionConfig::default(),
             topology: Some(TopologyConfig::default_zx6r()),
         }
     }

@@ -18,28 +18,7 @@ enum Tab {
     Density,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PresetType {
-    Straight,
-    Taper,
-    ExpansionChamber,
-    YJunction,
-    SingleCylinder,
-    InlineFour,
-}
-
-impl std::fmt::Display for PresetType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PresetType::Straight => write!(f, "Straight Tube"),
-            PresetType::Taper => write!(f, "Tapered Tube"),
-            PresetType::ExpansionChamber => write!(f, "Expansion Chamber"),
-            PresetType::YJunction => write!(f, "Y-Junction Exhaust"),
-            PresetType::SingleCylinder => write!(f, "Single Cylinder Engine"),
-            PresetType::InlineFour => write!(f, "Inline-4 Engine"),
-        }
-    }
-}
+// PresetType removed
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DragHandle {
@@ -69,7 +48,6 @@ struct SharedState {
     pulse_amplitude: f32,
     pulse_width: f32,
     
-    preset_type: Option<PresetType>,
     reset_trigger: bool,
     
     steps_per_second: f32,
@@ -100,6 +78,11 @@ struct SharedState {
     pub engine_compression_ratio: f32,
     pub engine_inertia: f32,
     pub engine_friction: f32,
+    
+    // Transmission
+    pub current_gear: u8,
+    pub vehicle_speed: f32,
+    pub vehicle_mass: f32,
     
     // Control inputs
     pub spin_rpm: f32,
@@ -133,9 +116,10 @@ fn spawn_solver_thread(
     shared_state: Arc<Mutex<SharedState>>,
     audio_buffer: Arc<Mutex<Vec<f32>>>,
     _filter_params: Arc<Mutex<AudioFilterParams>>,
+    config: engen_core::config::FullConfig,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut solver = Solver::new_inline_four(); // load ZX6R from yaml
+        let mut solver = Solver::new_from_config(&config);
 
         // Write initial solver state back to UI
         {
@@ -153,7 +137,6 @@ fn spawn_solver_thread(
         
         let mut local_jones_history = Vec::new();
         let mut local_audio_buf: Vec<f32> = Vec::with_capacity(128);
-        let mut debug_print_counter: u32 = 0;
         
         loop {
             let mut inject = false;
@@ -161,7 +144,6 @@ fn spawn_solver_thread(
             let mut width = 0.08;
             let mut reset = false;
             let speed;
-            let mut preset_to_load = None;
             let mut force_ui_update = false;
             let audio_volume;
             let reflection_filter;
@@ -169,9 +151,6 @@ fn spawn_solver_thread(
             
             {
                 if let Ok(mut state) = shared_state.lock() {
-                    if state.preset_type.is_some() {
-                        preset_to_load = state.preset_type.take();
-                    }
                     if state.reset_trigger {
                         state.reset_trigger = false;
                         reset = true;
@@ -219,6 +198,11 @@ fn spawn_solver_thread(
                         crank.inertia = state.engine_inertia;
                         crank.friction_coeff = state.engine_friction;
                     }
+                    
+                    solver.current_gear = state.current_gear;
+                    solver.vehicle_mass = state.vehicle_mass;
+                    // Note: we don't sync vehicle_speed TO the solver unless we want the UI to override it,
+                    // but we do want the solver to update the UI's vehicle_speed below.
                     if let Some(cyl) = solver.cylinders.first_mut() {
                         if (cyl.bore - state.engine_bore).abs() > 1e-4
                             || (cyl.stroke - state.engine_stroke).abs() > 1e-4
@@ -261,65 +245,6 @@ fn spawn_solver_thread(
                     break; // exit thread
                 }
             }
-            
-            if let Some(preset) = preset_to_load {
-                solver = match preset {
-                    PresetType::Straight => Solver::new_single_tube(RadiusProfile::Linear, BoundaryType::Closed, BoundaryType::Closed),
-                    PresetType::Taper => {
-                        let mut s = Solver::new_single_tube(RadiusProfile::Linear, BoundaryType::Closed, BoundaryType::Closed);
-                        s.tubes[0].r_start = 0.015;
-                        s.tubes[0].r_end = 0.04;
-                        s.tubes[0].rebuild_geometry();
-                        s.tubes[0].reset_state();
-                        s
-                    }
-                    PresetType::ExpansionChamber => Solver::new_single_tube(RadiusProfile::ExpansionChamber, BoundaryType::Closed, BoundaryType::Closed),
-                    PresetType::YJunction => Solver::new_y_junction(),
-                    PresetType::SingleCylinder => Solver::new_single_cylinder(),
-                    PresetType::InlineFour => Solver::new_inline_four(),
-                };
-                if let Ok(mut state) = shared_state.lock() {
-                    state.tubes = solver.tubes.clone();
-                    state.junctions = solver.junctions.clone();
-                    state.time = solver.t;
-                    
-                    if let Some(ref cyl) = solver.cylinders.first() {
-                        state.engine_bore = cyl.bore;
-                        state.engine_stroke = cyl.stroke;
-                        state.engine_conrod = cyl.conrod_length;
-                        state.engine_compression_ratio = cyl.compression_ratio;
-                    }
-                    if let Some(ref crank) = solver.crankshaft {
-                        state.engine_inertia = crank.inertia;
-                        state.engine_friction = crank.friction_coeff;
-                    }
-                    state.ignition_on = solver.ignition_on;
-                    state.ignition_timing_deg = solver.ignition_timing_deg;
-                    state.target_afr = solver.target_afr;
-                    
-                    state.ecu_map_pa = solver.ecu.map_pa;
-                    state.ecu_iac_lift = solver.ecu.iac_lift;
-                    state.ecu_is_cranking = solver.ecu.is_cranking;
-                    state.ecu_rev_limiter_active = solver.ecu.rev_limiter_active;
-                    
-                    state.cylinder_afr = solver.last_cylinder_afr;
-                    state.cylinder_lambda = solver.last_cylinder_lambda;
-                    state.residual_fraction = solver.last_residual_fraction;
-                    state.last_misfire = solver.last_misfire;
-                    state.misfire_count = solver.misfire_count;
-                    state.profile = solver.profile;
-                    
-                    // Sync starter disengagement
-                    if !solver.starter_active && state.starter_engaged {
-                        state.starter_engaged = false;
-                        state.starter_timer = 0.0;
-                    }
-                    
-                    state.cyl_pressure_histories.clear();
-                }
-                force_ui_update = true;
-            }
-            
             if reset {
                 // Sync geometry edited by the UI back to the solver
                 if let Ok(state) = shared_state.lock() {
@@ -447,6 +372,7 @@ fn spawn_solver_thread(
                             state.starter_timer = 0.0;
                         }
                         
+                        state.vehicle_speed = solver.vehicle_speed;
                         if let Some(ref crank) = solver.crankshaft {
                             state.has_engine = true;
                             state.engine_rpm = (crank.omega * 60.0) / (2.0 * std::f32::consts::PI);
@@ -467,23 +393,7 @@ fn spawn_solver_thread(
                                 }
                             }
 
-                            if let Some(cyl) = solver.cylinders.first() {
-                                // TEMP DEBUG: print throttle/lift/rpm/cyl mass once per second
-                                // to verify the throttle value is actually reaching tube 0 and
-                                // actually changing trapped cylinder mass. Remove once diagnosed.
-                                debug_print_counter += 1;
-                                if debug_print_counter >= 60 {
-                                    debug_print_counter = 0;
-                                    let lift = match solver.tubes[0].left_bc {
-                                        BoundaryType::Valve { lift } => lift,
-                                        _ => -1.0,
-                                    };
-                                    //eprintln!(
-                                    //    "[DEBUG] throttle={:.3} tube0_left_lift={:.3} rpm={:.0} cyl_mass={:.6} cyl_p={:.0}",
-                                    //    state.throttle, lift, state.engine_rpm, cyl.mass, cyl.p
-                                    //);
-                                }
-                            }
+
                         } else {
                             state.has_engine = false;
                             state.cyl_pressure_histories.clear();
@@ -499,6 +409,7 @@ fn spawn_solver_thread(
                         state.time = solver.t;
                         state.jones_history = local_jones_history.clone();
                         
+                        state.vehicle_speed = solver.vehicle_speed;
                         if let Some(ref crank) = solver.crankshaft {
                             state.has_engine = true;
                             state.engine_rpm = (crank.omega * 60.0) / (2.0 * std::f32::consts::PI);
@@ -540,7 +451,6 @@ struct EngenApp {
     limiter_input: LimiterType,
     fixed_scale: bool,
     
-    preset_selection: PresetType,
     selected_tube_id: Option<usize>,
     
     dragging_handle: Option<DragHandle>,
@@ -566,7 +476,6 @@ struct EngenApp {
     ignition_timing_deg_input: f32,
     target_afr_input: f32,
     audio_on_input: bool,
-    header_length_input: f32,
 }
 
 impl EngenApp {
@@ -591,7 +500,6 @@ impl EngenApp {
             heat_transfer_input: heat_transfer,
             limiter_input: limiter,
             fixed_scale: true,
-            preset_selection: PresetType::YJunction,
             selected_tube_id: Some(0),
             dragging_handle: None,
             flow_particles: Vec::new(),
@@ -613,7 +521,6 @@ impl EngenApp {
             ignition_timing_deg_input: timing,
             target_afr_input: afr,
             audio_on_input: audio,
-            header_length_input: 0.4,
         };
         app.reseed_particles();
         app
@@ -638,10 +545,30 @@ impl eframe::App for EngenApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint(); // Redraw constantly for smooth physics and flow animation
         
-        // Fullscreen hotkey check (F11)
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+        }
+
+        // Keyboard inputs
+        if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
+            if let Ok(mut state) = self.shared_state.lock() {
+                if state.current_gear > 0 {
+                    state.current_gear -= 1;
+                }
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+            if let Ok(mut state) = self.shared_state.lock() {
+                if state.current_gear < 6 {
+                    state.current_gear += 1;
+                }
+            }
+        }
+        if ctx.input(|i| i.key_down(egui::Key::W)) {
+            self.throttle_input = (self.throttle_input + 0.05).min(1.0);
+        } else if ctx.input(|i| i.key_down(egui::Key::S)) {
+            self.throttle_input = (self.throttle_input - 0.05).max(0.0);
         }
 
         let (tubes, junctions, current_time, rtf, sps, has_engine, engine_rpm, crank_angle, cyl_p, cyl_v, eng_bore, eng_stroke, eng_conrod, solver_profile) = {
@@ -704,70 +631,7 @@ impl eframe::App for EngenApp {
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(5.0);
-                
-                // Scenario Presets
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("Preset Scenarios").strong());
-                    let old_preset = self.preset_selection;
-                    egui::ComboBox::from_id_source("preset_combo")
-                        .selected_text(format!("{}", self.preset_selection))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.preset_selection, PresetType::Straight, "Straight Tube");
-                            ui.selectable_value(&mut self.preset_selection, PresetType::Taper, "Tapered Tube");
-                            ui.selectable_value(&mut self.preset_selection, PresetType::ExpansionChamber, "Expansion Chamber");
-                            ui.selectable_value(&mut self.preset_selection, PresetType::YJunction, "Y-Junction Exhaust");
-                            ui.selectable_value(&mut self.preset_selection, PresetType::SingleCylinder, "Single Cylinder Engine");
-                            ui.selectable_value(&mut self.preset_selection, PresetType::InlineFour, "Inline-4 Engine");
-                        });
-                    
-                    if self.preset_selection != old_preset {
-                        let mut state = self.shared_state.lock().unwrap();
-                        state.preset_type = Some(self.preset_selection);
-                        self.selected_tube_id = Some(0);
-                        // Defer reseed particles until next frame once solver recreates tubes
-                        ctx.request_repaint();
-                    }
 
-                    if self.preset_selection == PresetType::InlineFour {
-                        ui.add_space(5.0);
-                        if ui.add(egui::Slider::new(&mut self.header_length_input, 0.15..=1.0).text("Header Length").suffix(" m")).changed() {
-                            if let Ok(mut state) = self.shared_state.lock() {
-                                let l = self.header_length_input;
-                                let collector_x = -0.2 + l;
-                                
-                                // Re-scale header tubes 5, 6, 7, 8
-                                let y_ports = [0.6, 0.2, -0.2, -0.6];
-                                for idx in 0..4 {
-                                    let tube_idx = 5 + idx;
-                                    let y_port = y_ports[idx];
-                                    if tube_idx < state.tubes.len() {
-                                        state.tubes[tube_idx].p0 = [-0.2, y_port];
-                                        state.tubes[tube_idx].p1 = [-0.2 + 0.3 * l, y_port];
-                                        state.tubes[tube_idx].p2 = [collector_x - 0.3 * l, 0.0];
-                                        state.tubes[tube_idx].p3 = [collector_x, 0.0];
-                                    }
-                                }
-                                
-                                // Re-scale tailpipe tube 9 starting point
-                                if state.tubes.len() > 9 {
-                                    state.tubes[9].p0 = [collector_x, 0.0];
-                                    state.tubes[9].p1 = [collector_x + 0.2, 0.0];
-                                    state.tubes[9].p2 = [collector_x + 0.5, 0.0];
-                                    state.tubes[9].p3 = [collector_x + 0.8, 0.0];
-                                }
-                                
-                                // Re-scale collector junction position
-                                if state.junctions.len() > 1 {
-                                    state.junctions[1].pos = [collector_x, 0.0];
-                                }
-                                
-                                state.reset_trigger = true;
-                            }
-                        }
-                    }
-                });
-                
-                ui.add_space(10.0);
 
                 if has_engine {
                     ui.group(|ui| {
@@ -790,10 +654,36 @@ impl eframe::App for EngenApp {
                         });
                     });
                     ui.add_space(10.0);
+                    
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("Vehicle Telemetry").strong());
+                        ui.horizontal(|ui| {
+                            ui.label("Current Gear:");
+                            let gear_str = {
+                                let state = self.shared_state.lock().unwrap();
+                                if state.current_gear == 0 { "N".to_string() } else { state.current_gear.to_string() }
+                            };
+                            ui.label(egui::RichText::new(gear_str).color(egui::Color32::LIGHT_BLUE).strong());
+                            ui.label(egui::RichText::new("(Use Q/E to Shift)").weak().size(10.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Vehicle Speed:");
+                            let speed_mps = {
+                                let state = self.shared_state.lock().unwrap();
+                                state.vehicle_speed
+                            };
+                            let speed_kmh = speed_mps * 3.6;
+                            ui.label(egui::RichText::new(format!("{:.1} km/h", speed_kmh)).color(egui::Color32::LIGHT_GREEN));
+                        });
+                    });
+                    ui.add_space(10.0);
 
                     ui.group(|ui| {
                         ui.label(egui::RichText::new("Engine Controls").strong());
-                        ui.add(egui::Slider::new(&mut self.throttle_input, 0.0..=1.0).text("Throttle").suffix("x"));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Slider::new(&mut self.throttle_input, 0.0..=1.0).text("Throttle").suffix("x"));
+                            ui.label(egui::RichText::new("(W/S keys)").weak().size(10.0));
+                        });
                         
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.ignition_on_input, "Ignition ON");
@@ -804,8 +694,11 @@ impl eframe::App for EngenApp {
                         if ui.button("Render Test Audio (Inline 4)").clicked() {
                             std::thread::spawn(move || {
                                 println!("Starting offline render...");
-                                let mut solver = engen_core::cfd::solver::Solver::new_inline_four();
-                                
+                                let config = match engen_core::config::FullConfig::load_from_file("config/engine_preset.yaml") {
+                                    Ok(c) => c,
+                                    Err(_) => engen_core::config::FullConfig::default()
+                                };
+                                let mut solver = engen_core::cfd::solver::Solver::new_from_config(&config);
                                 // Sync current UI parameters to the solver
                                 if let Ok(state) = state_clone.lock() {
                                     for (k, tube) in solver.tubes.iter_mut().enumerate() {
@@ -2002,7 +1895,6 @@ fn main() -> eframe::Result<()> {
         inject_pulse: false,
         pulse_amplitude: 20000.0,
         pulse_width: 0.08,
-        preset_type: None,
         reset_trigger: false,
         steps_per_second: 0.0,
         real_time_factor: 0.0,
@@ -2024,6 +1916,9 @@ fn main() -> eframe::Result<()> {
         engine_compression_ratio: config.engine.compression_ratio,
         engine_inertia: config.engine.inertia,
         engine_friction: config.engine.viscous_friction,
+        current_gear: 0,
+        vehicle_speed: 0.0,
+        vehicle_mass: 200.0, // Default generic motorcycle mass
         spin_rpm: 1200.0,
         trigger_spin: false,
         throttle: 1.0,
@@ -2045,7 +1940,7 @@ fn main() -> eframe::Result<()> {
         profile: SolverProfile::default(),
     }));
     
-    let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state), Arc::clone(&audio_buffer), Arc::clone(&filter_params));
+    let _solver_handle = spawn_solver_thread(Arc::clone(&shared_state), Arc::clone(&audio_buffer), Arc::clone(&filter_params), config);
     
     eframe::run_native(
         "engen_ui",

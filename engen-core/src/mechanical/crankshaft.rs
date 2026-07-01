@@ -24,7 +24,7 @@ impl Crankshaft {
 
     /// Step the crankshaft dynamics forward in time.
     /// Returns the angular velocity `omega`.
-    pub fn step(&mut self, pressure_torque: f32, dt: f32) -> f32 {
+    pub fn step(&mut self, pressure_torque: f32, load_torque: f32, effective_inertia: f32, dt: f32) -> f32 {
         // Viscous friction (proportional to speed)
         let viscous_torque = -self.friction_coeff * self.omega;
         
@@ -33,7 +33,7 @@ impl Crankshaft {
             -self.coulomb_friction * self.omega.signum()
         } else {
             // At near-zero speed, Coulomb friction opposes net driving torque (stiction)
-            let driving = pressure_torque + viscous_torque + self.starter_torque;
+            let driving = pressure_torque + viscous_torque + self.starter_torque + load_torque;
             if driving.abs() > self.coulomb_friction {
                 -self.coulomb_friction * driving.signum()
             } else {
@@ -42,10 +42,10 @@ impl Crankshaft {
             }
         };
         
-        let net_torque = pressure_torque + viscous_torque + coulomb_torque + self.starter_torque;
+        let net_torque = pressure_torque + viscous_torque + coulomb_torque + self.starter_torque + load_torque;
         
         // Update angular velocity (I * d_omega/dt = torque)
-        self.omega += (net_torque / self.inertia) * dt;
+        self.omega += (net_torque / effective_inertia) * dt;
         
         // Prevent reverse rotation: engine only spins forward
         if self.omega < 0.0 {

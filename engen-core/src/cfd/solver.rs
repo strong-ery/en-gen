@@ -427,6 +427,17 @@ pub struct Solver {
     pub starter_active: bool,
     pub ecu: Ecu,
     
+    // Transmission
+    pub current_gear: u8,
+    pub last_gear: u8,
+    pub vehicle_speed: f32,
+    pub vehicle_mass: f32,
+    pub wheel_radius: f32,
+    pub primary_drive_ratio: f32,
+    pub final_drive_ratio: f32,
+    pub gear_ratios: [f32; 6],
+    pub clutch_timer: f32,
+    
     // Telemetry for species & misfires
     pub last_cylinder_afr: f32,
     pub last_cylinder_lambda: f32,
@@ -509,6 +520,17 @@ impl Solver {
             smoothed_throttle: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
+            
+            current_gear: 0,
+            last_gear: 0,
+            vehicle_speed: 0.0,
+            vehicle_mass: 270.0,
+            wheel_radius: 0.315,
+            primary_drive_ratio: 1.900,
+            final_drive_ratio: 2.867,
+            gear_ratios: [2.846, 2.200, 1.850, 1.600, 1.421, 1.300],
+            clutch_timer: 0.0,
+            
             last_cylinder_afr: 14.7,
             last_cylinder_lambda: 1.0,
             last_residual_fraction: 0.0,
@@ -619,6 +641,17 @@ impl Solver {
             smoothed_throttle: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
+            
+            current_gear: 0,
+            last_gear: 0,
+            vehicle_speed: 0.0,
+            vehicle_mass: 270.0,
+            wheel_radius: 0.315,
+            primary_drive_ratio: 1.900,
+            final_drive_ratio: 2.867,
+            gear_ratios: [2.846, 2.200, 1.850, 1.600, 1.421, 1.300],
+            clutch_timer: 0.0,
+            
             last_cylinder_afr: 14.7,
             last_cylinder_lambda: 1.0,
             last_residual_fraction: 0.0,
@@ -715,6 +748,17 @@ impl Solver {
             smoothed_throttle: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
+            
+            current_gear: 0,
+            last_gear: 0,
+            vehicle_speed: 0.0,
+            vehicle_mass: 270.0,
+            wheel_radius: 0.315,
+            primary_drive_ratio: 1.900,
+            final_drive_ratio: 2.867,
+            gear_ratios: [2.846, 2.200, 1.850, 1.600, 1.421, 1.300],
+            clutch_timer: 0.0,
+            
             last_cylinder_afr: 14.7,
             last_cylinder_lambda: 1.0,
             last_residual_fraction: 0.0,
@@ -732,16 +776,7 @@ impl Solver {
         solver
     }
 
-    pub fn new_inline_four() -> Self {
-        let config = match crate::config::FullConfig::load_from_file("config/engine_preset.yaml") {
-            Ok(c) => c,
-            Err(_) => {
-                let default_cfg = crate::config::FullConfig::default();
-                let _ = std::fs::create_dir_all("config");
-                let _ = default_cfg.save_to_file("config/engine_preset.yaml");
-                default_cfg
-            }
-        };
+    pub fn new_from_config(config: &crate::config::FullConfig) -> Self {
 
         let parse_bc = |bc_str: &str| -> BoundaryType {
             if bc_str == "Closed" { return BoundaryType::Closed; }
@@ -845,6 +880,17 @@ impl Solver {
             smoothed_throttle: 1.0,
             starter_active: false,
             ecu,
+            
+            current_gear: 0,
+            last_gear: 0,
+            vehicle_speed: 0.0,
+            vehicle_mass: config.transmission.vehicle_mass_kg,
+            wheel_radius: config.transmission.wheel_radius_m,
+            primary_drive_ratio: config.transmission.primary_drive_ratio,
+            final_drive_ratio: config.transmission.final_drive_ratio,
+            gear_ratios: config.transmission.gear_ratios,
+            clutch_timer: 0.0,
+            
             last_cylinder_afr: config.ecu.target_afr,
             last_cylinder_lambda: config.ecu.target_afr / 14.7,
             last_residual_fraction: 0.0,
@@ -989,7 +1035,6 @@ impl Solver {
 
     fn single_substep(&mut self, dt: f32) {
         let gamma = 1.4;
-        let num_tubes = self.tubes.len();
 
         // Only pay for Instant::now()/QueryPerformanceCounter syscalls on a
         // sampled subset of substeps -- profiling every substep (up to 200x
@@ -1047,8 +1092,79 @@ impl Solver {
                 self.starter_active = false;
             }
 
+            // Transmission & Load Physics
+            let mut load_torque = 0.0;
+            let mut effective_inertia = crank.inertia;
+            
+            // Handle Gear Shift Feedback (Momentum Conservation / Rigid Coupling)
+            if self.current_gear != self.last_gear {
+                self.clutch_timer = 0.2; // 200ms shift duration
+                self.last_gear = self.current_gear;
+            }
+            
+            if self.clutch_timer > 0.0 {
+                self.clutch_timer -= dt;
+            }
+            
+            if self.current_gear > 0 {
+                let total_ratio = self.primary_drive_ratio * self.gear_ratios[(self.current_gear - 1) as usize] * self.final_drive_ratio;
+                
+                let omega_trans = self.vehicle_speed / self.wheel_radius * total_ratio;
+                let slip = omega_trans - crank.omega;
+                
+                let mut max_clutch_torque = 250.0; // Nm holding capacity
+                if self.clutch_timer > 0.1 {
+                    // Clutch is fully pulled in for the first 100ms of shift
+                    max_clutch_torque = 0.0;
+                }
+                
+                // If slip is very low and clutch is dropped, we rigidly lock
+                let is_locked = self.clutch_timer <= 0.1 && slip.abs() < 10.0;
+                
+                // Aerodynamic drag force: F_drag = 0.5 * rho * CdA * v^2
+                // Approximate: CdA = 0.4 m^2, rho = 1.225
+                let drag_force = 0.5 * 1.225 * 0.4 * self.vehicle_speed * self.vehicle_speed;
+                // Rolling resistance: F_rr = C_rr * m * g
+                let rolling_force = 0.015 * self.vehicle_mass * 9.81;
+                
+                if is_locked {
+                    // Locked physics: Engine and vehicle are rigidly coupled
+                    let vehicle_inertia_at_crank = self.vehicle_mass * (self.wheel_radius / total_ratio).powi(2);
+                    effective_inertia += vehicle_inertia_at_crank;
+                    
+                    let total_road_force = drag_force + rolling_force;
+                    let road_torque_at_wheel = total_road_force * self.wheel_radius;
+                    
+                    // Reflected load torque on the engine
+                    load_torque = -(road_torque_at_wheel / total_ratio);
+                    
+                    // Update vehicle speed based on engine speed (rigid clutch assumption)
+                    self.vehicle_speed = (crank.omega / total_ratio) * self.wheel_radius;
+                } else {
+                    // Slipping physics: Engine and vehicle are decoupled
+                    let actual_clutch_torque = max_clutch_torque * slip.signum();
+                    
+                    // Engine sees the clutch torque as load
+                    load_torque = actual_clutch_torque;
+                    
+                    // Vehicle sees the opposite clutch torque, plus road forces
+                    let clutch_force_at_wheel = -(actual_clutch_torque * total_ratio) / self.wheel_radius;
+                    let total_road_force = clutch_force_at_wheel - drag_force - rolling_force;
+                    
+                    self.vehicle_speed += (total_road_force / self.vehicle_mass) * dt;
+                    self.vehicle_speed = self.vehicle_speed.max(0.0);
+                }
+            } else {
+                // Neutral: Vehicle coasts and decelerates slowly
+                let drag_force = 0.5 * 1.225 * 0.4 * self.vehicle_speed * self.vehicle_speed;
+                let rolling_force = 0.015 * self.vehicle_mass * 9.81;
+                let total_road_force = -drag_force - rolling_force;
+                self.vehicle_speed += (total_road_force / self.vehicle_mass) * dt;
+                self.vehicle_speed = self.vehicle_speed.max(0.0);
+            }
+
             // Advance crankshaft dynamics
-            crank.step(pressure_torque, dt);
+            crank.step(pressure_torque, load_torque, effective_inertia, dt);
             let theta_new = crank.theta;
             
             // Calculate new volumes and volume increments (delta_vol)
