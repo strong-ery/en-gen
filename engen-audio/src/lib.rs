@@ -125,7 +125,7 @@ impl AudioSystem {
         
         let buffer_clone = Arc::clone(&buffer);
         let mut read_phase = 0.0f64;
-        let ratio = 64000.0 / sample_rate;
+        let ratio = 40000.0 / sample_rate;
         
         let initial_params = {
             let p = filter_params.lock().unwrap();

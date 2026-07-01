@@ -1,15 +1,422 @@
 engine:
   bore: 0.067
-  stroke: 0.0425
+  stroke: 0.0451
   conrod_length: 0.083
   compression_ratio: 12.9
   inertia: 0.003
   viscous_friction: 0.0003
-  wall_friction: 0.025
-  heat_transfer: 30.0
+  wall_friction: 0.015
+  heat_transfer: 1.0
+  intake_valve_open_deg: 320.0
+  intake_valve_close_deg: 605.0
+  exhaust_valve_open_deg: 120.0
+  exhaust_valve_close_deg: 395.0
 ecu:
   target_idle_rpm: 1500.0
   redline_rpm: 16000.0
   target_afr: 14.7
   manual_afr_control: false
   ignition_timing_deg: 15.0
+  iac_kp: 0.0005
+  iac_ki: 0.00005
+  iac_kd: 0.00002
+  throttle_dashpot_lift: 0.002
+  overrun_dashpot_lift: 0.012
+  min_iac_lift: 0.002
+  max_iac_lift: 0.02
+  rpm_bins:
+  - 1000.0
+  - 3000.0
+  - 6000.0
+  - 9000.0
+  - 12000.0
+  - 14000.0
+  - 16000.0
+  map_bins_kpa:
+  - 20.0
+  - 40.0
+  - 60.0
+  - 80.0
+  - 100.0
+  ve_table:
+  - - 0.5
+    - 0.55
+    - 0.62
+    - 0.68
+    - 0.7
+  - - 0.6
+    - 0.7
+    - 0.8
+    - 0.86
+    - 0.88
+  - - 0.65
+    - 0.75
+    - 0.85
+    - 0.9
+    - 0.92
+  - - 0.7
+    - 0.8
+    - 0.9
+    - 0.95
+    - 0.98
+  - - 0.75
+    - 0.85
+    - 0.95
+    - 1.05
+    - 0.98
+  - - 0.75
+    - 0.85
+    - 0.95
+    - 1.02
+    - 0.95
+  - - 0.7
+    - 0.8
+    - 0.9
+    - 0.95
+    - 0.92
+  spark_table:
+  - - 22.0
+    - 20.0
+    - 18.0
+    - 14.0
+    - 10.0
+  - - 36.0
+    - 34.0
+    - 30.0
+    - 24.0
+    - 18.0
+  - - 40.0
+    - 38.0
+    - 34.0
+    - 28.0
+    - 24.0
+  - - 42.0
+    - 40.0
+    - 36.0
+    - 30.0
+    - 26.0
+  - - 44.0
+    - 42.0
+    - 40.0
+    - 36.0
+    - 34.0
+  - - 46.0
+    - 44.0
+    - 42.0
+    - 38.0
+    - 36.0
+  - - 48.0
+    - 46.0
+    - 44.0
+    - 40.0
+    - 38.0
+topology:
+  tubes:
+  - id: 0
+    name: Intake Main
+    num_cells: 10
+    p0:
+    - -1.2
+    - 0.0
+    p1:
+    - -1.0
+    - 0.0
+    p2:
+    - -0.8
+    - 0.0
+    p3:
+    - -0.7
+    - 0.0
+    r_start: 0.04
+    r_mid: 0.04
+    r_end: 0.04
+    radius_profile: Linear
+    left_bc: Valve:1.0
+    right_bc: Closed
+  - id: 1
+    name: Intake Runner 1
+    num_cells: 5
+    p0:
+    - -0.3
+    - 0.6
+    p1:
+    - -0.25
+    - 0.6
+    p2:
+    - -0.2
+    - 0.6
+    p3:
+    - -0.15
+    - 0.6
+    r_start: 0.022
+    r_mid: 0.022
+    r_end: 0.022
+    radius_profile: Linear
+    left_bc: Closed
+    right_bc: Valve:0.0
+  - id: 2
+    name: Intake Runner 2
+    num_cells: 5
+    p0:
+    - -0.3
+    - 0.2
+    p1:
+    - -0.25
+    - 0.2
+    p2:
+    - -0.2
+    - 0.2
+    p3:
+    - -0.15
+    - 0.2
+    r_start: 0.022
+    r_mid: 0.022
+    r_end: 0.022
+    radius_profile: Linear
+    left_bc: Closed
+    right_bc: Valve:0.0
+  - id: 3
+    name: Intake Runner 3
+    num_cells: 5
+    p0:
+    - -0.3
+    - -0.2
+    p1:
+    - -0.25
+    - -0.2
+    p2:
+    - -0.2
+    - -0.2
+    p3:
+    - -0.15
+    - -0.2
+    r_start: 0.022
+    r_mid: 0.022
+    r_end: 0.022
+    radius_profile: Linear
+    left_bc: Closed
+    right_bc: Valve:0.0
+  - id: 4
+    name: Intake Runner 4
+    num_cells: 5
+    p0:
+    - -0.3
+    - -0.6
+    p1:
+    - -0.25
+    - -0.6
+    p2:
+    - -0.2
+    - -0.6
+    p3:
+    - -0.15
+    - -0.6
+    r_start: 0.022
+    r_mid: 0.022
+    r_end: 0.022
+    radius_profile: Linear
+    left_bc: Closed
+    right_bc: Valve:0.0
+  - id: 5
+    name: Header 1
+    num_cells: 8
+    p0:
+    - 0.15
+    - 0.6
+    p1:
+    - 0.3
+    - 0.6
+    p2:
+    - 0.4
+    - 0.3
+    p3:
+    - 0.5
+    - 0.0
+    r_start: 0.02
+    r_mid: 0.02
+    r_end: 0.02
+    radius_profile: Linear
+    left_bc: Valve:0.0
+    right_bc: Closed
+  - id: 6
+    name: Header 2
+    num_cells: 8
+    p0:
+    - 0.15
+    - 0.2
+    p1:
+    - 0.3
+    - 0.2
+    p2:
+    - 0.4
+    - 0.1
+    p3:
+    - 0.5
+    - 0.0
+    r_start: 0.02
+    r_mid: 0.02
+    r_end: 0.02
+    radius_profile: Linear
+    left_bc: Valve:0.0
+    right_bc: Closed
+  - id: 7
+    name: Header 3
+    num_cells: 8
+    p0:
+    - 0.15
+    - -0.2
+    p1:
+    - 0.3
+    - -0.2
+    p2:
+    - 0.4
+    - -0.1
+    p3:
+    - 0.5
+    - 0.0
+    r_start: 0.02
+    r_mid: 0.02
+    r_end: 0.02
+    radius_profile: Linear
+    left_bc: Valve:0.0
+    right_bc: Closed
+  - id: 8
+    name: Header 4
+    num_cells: 8
+    p0:
+    - 0.15
+    - -0.6
+    p1:
+    - 0.3
+    - -0.6
+    p2:
+    - 0.4
+    - -0.3
+    p3:
+    - 0.5
+    - 0.0
+    r_start: 0.02
+    r_mid: 0.02
+    r_end: 0.02
+    radius_profile: Linear
+    left_bc: Valve:0.0
+    right_bc: Closed
+  - id: 9
+    name: Pre-chamber Resonator
+    num_cells: 10
+    p0:
+    - 0.4
+    - 0.0
+    p1:
+    - 0.5
+    - 0.0
+    p2:
+    - 0.7
+    - 0.0
+    p3:
+    - 0.8
+    - 0.0
+    r_start: 0.028
+    r_mid: 0.08
+    r_end: 0.028
+    radius_profile: ExpansionChamber
+    left_bc: Valve:1.0
+    right_bc: Closed
+  - id: 10
+    name: Tailpipe
+    num_cells: 10
+    p0:
+    - 0.8
+    - 0.0
+    p1:
+    - 0.9
+    - 0.0
+    p2:
+    - 1.0
+    - 0.0
+    p3:
+    - 1.2
+    - 0.0
+    r_start: 0.028
+    r_mid: 0.028
+    r_end: 0.028
+    radius_profile: Linear
+    left_bc: Closed
+    right_bc: Open
+  junctions:
+  - id: 0
+    pos:
+    - -0.7
+    - 0.0
+    connections:
+    - tube_id: 0
+      side: Right
+    - tube_id: 1
+      side: Left
+    - tube_id: 2
+      side: Left
+    - tube_id: 3
+      side: Left
+    - tube_id: 4
+      side: Left
+  - id: 1
+    pos:
+    - 0.4
+    - 0.0
+    connections:
+    - tube_id: 5
+      side: Right
+    - tube_id: 6
+      side: Right
+    - tube_id: 7
+      side: Right
+    - tube_id: 8
+      side: Right
+    - tube_id: 9
+      side: Left
+  - id: 2
+    pos:
+    - 0.8
+    - 0.0
+    connections:
+    - tube_id: 9
+      side: Right
+    - tube_id: 10
+      side: Left
+  cylinders:
+  - id: 0
+    crank_offset_deg: 0.0
+    connections:
+    - tube_id: 1
+      side: Right
+      valve_type: Intake
+    - tube_id: 5
+      side: Left
+      valve_type: Exhaust
+  - id: 1
+    crank_offset_deg: 180.0
+    connections:
+    - tube_id: 2
+      side: Right
+      valve_type: Intake
+    - tube_id: 6
+      side: Left
+      valve_type: Exhaust
+  - id: 2
+    crank_offset_deg: 540.0
+    connections:
+    - tube_id: 3
+      side: Right
+      valve_type: Intake
+    - tube_id: 7
+      side: Left
+      valve_type: Exhaust
+  - id: 3
+    crank_offset_deg: 360.0
+    connections:
+    - tube_id: 4
+      side: Right
+      valve_type: Intake
+    - tube_id: 8
+      side: Left
+      valve_type: Exhaust

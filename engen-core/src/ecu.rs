@@ -32,14 +32,14 @@ impl PidController {
         self.kp * error + self.ki * self.integral + self.kd * derivative
     }
     
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, current_error: f32) {
         self.integral = 0.0;
-        self.last_error = 0.0;
+        self.last_error = current_error;
     }
 }
 
 // 2D Bilinear Interpolation Helper
-fn lookup_2d(x: f32, y: f32, xs: &[f32], ys: &[f32], table: &[&[f32]]) -> f32 {
+fn lookup_2d(x: f32, y: f32, xs: &[f32], ys: &[f32], table: &[Vec<f32>]) -> f32 {
     let x_idx = match xs.iter().position(|&val| val >= x) {
         Some(0) => 0,
         Some(i) => i - 1,
@@ -91,33 +91,55 @@ pub struct Ecu {
     pub target_idle_rpm: f32,
     pub redline_rpm: f32,
     pub manual_afr_control: bool,
+    
+    // Configurable maps and limits
+    pub throttle_dashpot_lift: f32,
+    pub overrun_dashpot_lift: f32,
+    pub min_iac_lift: f32,
+    pub max_iac_lift: f32,
+    pub rpm_bins: Vec<f32>,
+    pub map_bins_kpa: Vec<f32>,
+    pub ve_table: Vec<Vec<f32>>,
+    pub spark_table: Vec<Vec<f32>>,
 }
 
 impl Default for Ecu {
     fn default() -> Self {
-        Self {
-            map_pa: 101325.0,
-            engine_rpm: 0.0,
-            tps: 0.0,
-            iac_lift: 0.005,
-            ignition_timing_deg: 10.0,
-            target_afr: 14.7,
-            rev_limiter_active: false,
-            fuel_cut: false,
-            spark_cut: false,
-            is_cranking: true,
-            crank_to_run_timer: 0.0,
-            iac_pid: PidController::new(0.00005, 0.00002, 0.000005),
-            target_idle_rpm: 2800.0,
-            redline_rpm: 13000.0,
-            manual_afr_control: false,
-        }
+        Self::from_config(&crate::config::EcuConfig::default())
     }
 }
 
 impl Ecu {
     pub fn new() -> Self {
         Self::default()
+    }
+    
+    pub fn from_config(config: &crate::config::EcuConfig) -> Self {
+        Self {
+            map_pa: 101325.0,
+            engine_rpm: 0.0,
+            tps: 0.0,
+            iac_lift: config.max_iac_lift / 2.0,
+            ignition_timing_deg: config.ignition_timing_deg,
+            target_afr: config.target_afr,
+            rev_limiter_active: false,
+            fuel_cut: false,
+            spark_cut: false,
+            is_cranking: true,
+            crank_to_run_timer: 0.0,
+            iac_pid: PidController::new(config.iac_kp, config.iac_ki, config.iac_kd),
+            target_idle_rpm: config.target_idle_rpm,
+            redline_rpm: config.redline_rpm,
+            manual_afr_control: config.manual_afr_control,
+            throttle_dashpot_lift: config.throttle_dashpot_lift,
+            overrun_dashpot_lift: config.overrun_dashpot_lift,
+            min_iac_lift: config.min_iac_lift,
+            max_iac_lift: config.max_iac_lift,
+            rpm_bins: config.rpm_bins.clone(),
+            map_bins_kpa: config.map_bins_kpa.clone(),
+            ve_table: config.ve_table.clone(),
+            spark_table: config.spark_table.clone(),
+        }
     }
 
     /// Update sensor values and run ECU logic (fueling, timing, idle, rev limits)
@@ -144,7 +166,8 @@ impl Ecu {
             if self.engine_rpm < 150.0 {
                 self.is_cranking = true;
                 self.crank_to_run_timer = 0.0;
-                self.iac_pid.reset();
+                let error = self.target_idle_rpm - self.engine_rpm;
+                self.iac_pid.reset(error);
             }
         }
 
@@ -162,16 +185,25 @@ impl Ecu {
         // --- Idle Speed Control ---
         if self.is_cranking {
             // Cranking IAC lift is high to assist starting
-            self.iac_lift = 0.015; 
+            self.iac_lift = 0.010; 
+            let error = self.target_idle_rpm - self.engine_rpm;
+            self.iac_pid.reset(error);
         } else if self.tps > 0.02 {
             // Dashpot mode: hold IAC slightly open during throttle application
-            self.iac_lift = 0.003;
-            self.iac_pid.reset();
+            self.iac_lift = self.throttle_dashpot_lift;
+            let error = self.target_idle_rpm - self.engine_rpm;
+            self.iac_pid.reset(error);
+        } else if self.engine_rpm > self.target_idle_rpm + 500.0 {
+            // Dashpot / overrun mode: engine is coasting down to idle.
+            // Hold IAC at a high baseline to catch the engine and prevent PID integral windup.
+            self.iac_lift = self.overrun_dashpot_lift;
+            let error = self.target_idle_rpm - self.engine_rpm;
+            self.iac_pid.reset(error);
         } else {
             // Closed-loop Idle Speed Control
             let error = self.target_idle_rpm - self.engine_rpm;
             let iac_adj = self.iac_pid.step(error, dt);
-            self.iac_lift = (self.iac_lift + iac_adj).clamp(0.001, 0.015);
+            self.iac_lift = (self.iac_lift + iac_adj).clamp(self.min_iac_lift, self.max_iac_lift);
         }
 
         // --- Target AFR Map ---
@@ -197,23 +229,11 @@ impl Ecu {
             // Low fixed advance during cranking to prevent starter kickback
             self.ignition_timing_deg = 5.0;
         } else {
-            // Bilinear spark map based on RPM and MAP
-            // Rows: RPM (500, 1000, 2000, 3000, 4500, 6500)
-            // Cols: MAP kPa (20, 40, 60, 80, 100)
-            let rpms = [500.0, 1000.0, 2000.0, 3000.0, 4500.0, 6500.0];
-            let maps_kpa = [20.0, 40.0, 60.0, 80.0, 100.0];
-            let spark_table: &[&[f32]] = &[
-                &[15.0, 15.0, 12.0, 10.0, 8.0],   // 500 RPM
-                &[22.0, 20.0, 18.0, 14.0, 10.0],  // 1000 RPM (idle timing/advance)
-                &[30.0, 28.0, 25.0, 20.0, 15.0],  // 2000 RPM
-                &[36.0, 34.0, 30.0, 24.0, 18.0],  // 3000 RPM
-                &[38.0, 36.0, 32.0, 26.0, 22.0],  // 4500 RPM
-                &[40.0, 38.0, 34.0, 28.0, 24.0],  // 6500 RPM
-            ];
-
-            let clamped_rpm = self.engine_rpm.clamp(500.0, 6500.0);
+            let min_rpm = *self.rpm_bins.first().unwrap_or(&1000.0);
+            let max_rpm = *self.rpm_bins.last().unwrap_or(&16000.0);
+            let clamped_rpm = self.engine_rpm.clamp(min_rpm, max_rpm);
             let clamped_map_kpa = (self.map_pa / 1000.0).clamp(20.0, 100.0);
-            self.ignition_timing_deg = lookup_2d(clamped_rpm, clamped_map_kpa, &rpms, &maps_kpa, spark_table);
+            self.ignition_timing_deg = lookup_2d(clamped_rpm, clamped_map_kpa, &self.rpm_bins, &self.map_bins_kpa, &self.spark_table);
         }
     }
 
@@ -224,23 +244,11 @@ impl Ecu {
             return 0.0;
         }
 
-        // Bilinear Volumetric Efficiency (VE) table lookup
-        // Rows: RPM (500, 1000, 2000, 3000, 4500, 6500)
-        // Cols: MAP kPa (20, 40, 60, 80, 100)
-        let rpms = [500.0, 1000.0, 2000.0, 3000.0, 4500.0, 6500.0];
-        let maps_kpa = [20.0, 40.0, 60.0, 80.0, 100.0];
-        let ve_table: &[&[f32]] = &[
-            &[0.45, 0.50, 0.55, 0.60, 0.62],  // 500 RPM
-            &[0.50, 0.55, 0.62, 0.68, 0.70],  // 1000 RPM
-            &[0.55, 0.65, 0.75, 0.80, 0.82],  // 2000 RPM
-            &[0.60, 0.70, 0.80, 0.86, 0.88],  // 3000 RPM (torque peak region)
-            &[0.58, 0.68, 0.78, 0.84, 0.85],  // 4500 RPM
-            &[0.52, 0.62, 0.72, 0.78, 0.80],  // 6500 RPM
-        ];
-
-        let clamped_rpm = self.engine_rpm.clamp(500.0, 6500.0);
+        let min_rpm = *self.rpm_bins.first().unwrap_or(&1000.0);
+        let max_rpm = *self.rpm_bins.last().unwrap_or(&16000.0);
+        let clamped_rpm = self.engine_rpm.clamp(min_rpm, max_rpm);
         let clamped_map_kpa = (self.map_pa / 1000.0).clamp(20.0, 100.0);
-        let ve = lookup_2d(clamped_rpm, clamped_map_kpa, &rpms, &maps_kpa, ve_table);
+        let ve = lookup_2d(clamped_rpm, clamped_map_kpa, &self.rpm_bins, &self.map_bins_kpa, &self.ve_table);
 
         // Speed-density equation: m_air = (P * V * VE) / (R * T)
         let r_air = 287.05; // J/(kg*K)

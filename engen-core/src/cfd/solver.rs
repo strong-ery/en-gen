@@ -435,6 +435,12 @@ pub struct Solver {
     pub misfire_model: crate::combustion::MisfireModel,
     pub profile: SolverProfile,
     initial_mass_flows: Vec<(f32, f32)>,
+    
+    // Valve timing parameters (radians)
+    pub intake_valve_open_rad: f32,
+    pub intake_valve_close_rad: f32,
+    pub exhaust_valve_open_rad: f32,
+    pub exhaust_valve_close_rad: f32,
 }
 
 impl Solver {
@@ -509,6 +515,10 @@ impl Solver {
             misfire_model: crate::combustion::MisfireModel::new(),
             profile: SolverProfile::default(),
             initial_mass_flows: Vec::new(),
+            intake_valve_open_rad: 320.0f32.to_radians(),
+            intake_valve_close_rad: 605.0f32.to_radians(),
+            exhaust_valve_open_rad: 120.0f32.to_radians(),
+            exhaust_valve_close_rad: 395.0f32.to_radians(),
         };
         solver.update_connected_flags();
         solver
@@ -614,6 +624,10 @@ impl Solver {
             misfire_model: crate::combustion::MisfireModel::new(),
             profile: SolverProfile::default(),
             initial_mass_flows: Vec::new(),
+            intake_valve_open_rad: 320.0f32.to_radians(),
+            intake_valve_close_rad: 605.0f32.to_radians(),
+            exhaust_valve_open_rad: 120.0f32.to_radians(),
+            exhaust_valve_close_rad: 395.0f32.to_radians(),
         };
         solver.update_connected_flags();
         solver
@@ -705,6 +719,10 @@ impl Solver {
             misfire_model: crate::combustion::MisfireModel::new(),
             profile: SolverProfile::default(),
             initial_mass_flows: Vec::new(),
+            intake_valve_open_rad: 320.0f32.to_radians(),
+            intake_valve_close_rad: 605.0f32.to_radians(),
+            exhaust_valve_open_rad: 120.0f32.to_radians(),
+            exhaust_valve_close_rad: 395.0f32.to_radians(),
         };
         solver.update_connected_flags();
         solver
@@ -721,277 +739,91 @@ impl Solver {
             }
         };
 
-        let pi = std::f32::consts::PI;
-
-        // Tube 0: Main Intake Pipe (Atmosphere -> Plenum Junction)
-        let tube0 = Tube::new(
-            0,
-            "Intake Main".to_string(),
-            20,
-            [-1.2, 0.0],
-            [-1.0, 0.0],
-            [-0.8, 0.0],
-            [-0.7, 0.0],
-            0.025, // 25mm radius
-            0.025,
-            0.025,
-            RadiusProfile::Linear,
-            BoundaryType::Valve { lift: 1.0 }, // Throttle
-            BoundaryType::Closed,
-        );
-
-        // Tube 1: Intake Runner 1
-        let tube1 = Tube::new(
-            1,
-            "Intake Runner 1".to_string(),
-            10,
-            [-0.7, 0.0],
-            [-0.6, 0.2],
-            [-0.5, 0.4],
-            [-0.4, 0.6],
-            0.018, // 18mm radius
-            0.018,
-            0.018,
-            RadiusProfile::Linear,
-            BoundaryType::Closed,
-            BoundaryType::Valve { lift: 0.0 }, // Intake valve 1
-        );
-
-        // Tube 2: Intake Runner 2
-        let tube2 = Tube::new(
-            2,
-            "Intake Runner 2".to_string(),
-            10,
-            [-0.7, 0.0],
-            [-0.6, 0.1],
-            [-0.5, 0.15],
-            [-0.4, 0.2],
-            0.018,
-            0.018,
-            0.018,
-            RadiusProfile::Linear,
-            BoundaryType::Closed,
-            BoundaryType::Valve { lift: 0.0 }, // Intake valve 2
-        );
-
-        // Tube 3: Intake Runner 3
-        let tube3 = Tube::new(
-            3,
-            "Intake Runner 3".to_string(),
-            10,
-            [-0.7, 0.0],
-            [-0.6, -0.1],
-            [-0.5, -0.15],
-            [-0.4, -0.2],
-            0.018,
-            0.018,
-            0.018,
-            RadiusProfile::Linear,
-            BoundaryType::Closed,
-            BoundaryType::Valve { lift: 0.0 }, // Intake valve 3
-        );
-
-        // Tube 4: Intake Runner 4
-        let tube4 = Tube::new(
-            4,
-            "Intake Runner 4".to_string(),
-            10,
-            [-0.7, 0.0],
-            [-0.6, -0.2],
-            [-0.5, -0.4],
-            [-0.4, -0.6],
-            0.018,
-            0.018,
-            0.018,
-            RadiusProfile::Linear,
-            BoundaryType::Closed,
-            BoundaryType::Valve { lift: 0.0 }, // Intake valve 4
-        );
-
-        // Tube 5: Exhaust Header 1
-        let tube5 = Tube::new(
-            5,
-            "Header 1".to_string(),
-            15,
-            [-0.2, 0.6],
-            [0.0, 0.4],
-            [0.2, 0.2],
-            [0.4, 0.0],
-            0.016, // 16mm radius
-            0.016,
-            0.016,
-            RadiusProfile::Linear,
-            BoundaryType::Valve { lift: 0.0 }, // Exhaust valve 1
-            BoundaryType::Closed,
-        );
-
-        // Tube 6: Exhaust Header 2
-        let tube6 = Tube::new(
-            6,
-            "Header 2".to_string(),
-            15,
-            [-0.2, 0.2],
-            [0.0, 0.1],
-            [0.2, 0.05],
-            [0.4, 0.0],
-            0.016,
-            0.016,
-            0.016,
-            RadiusProfile::Linear,
-            BoundaryType::Valve { lift: 0.0 }, // Exhaust valve 2
-            BoundaryType::Closed,
-        );
-
-        // Tube 7: Exhaust Header 3
-        let tube7 = Tube::new(
-            7,
-            "Header 3".to_string(),
-            15,
-            [-0.2, -0.2],
-            [0.0, -0.1],
-            [0.2, -0.05],
-            [0.4, 0.0],
-            0.016,
-            0.016,
-            0.016,
-            RadiusProfile::Linear,
-            BoundaryType::Valve { lift: 0.0 }, // Exhaust valve 3
-            BoundaryType::Closed,
-        );
-
-        // Tube 8: Exhaust Header 4
-        let tube8 = Tube::new(
-            8,
-            "Header 4".to_string(),
-            15,
-            [-0.2, -0.6],
-            [0.0, -0.4],
-            [0.2, -0.2],
-            [0.4, 0.0],
-            0.016,
-            0.016,
-            0.016,
-            RadiusProfile::Linear,
-            BoundaryType::Valve { lift: 0.0 }, // Exhaust valve 4
-            BoundaryType::Closed,
-        );
-
-        // Tube 9: Main Exhaust Pipe (Collector -> Atmosphere)
-        let tube9 = Tube::new(
-            9,
-            "Main Exhaust".to_string(),
-            30,
-            [0.4, 0.0],
-            [0.6, 0.0],
-            [0.9, 0.0],
-            [1.2, 0.0],
-            0.022, // 22mm radius
-            0.022,
-            0.022,
-            RadiusProfile::Linear,
-            BoundaryType::Closed,
-            BoundaryType::Open,
-        );
-
-        // --- Junction 0 (Intake Plenum) ---
-        let vol_0 = (tube0.area[tube0.num_cells] * tube0.dx +
-                     tube1.area[1] * tube1.dx +
-                     tube2.area[1] * tube2.dx +
-                     tube3.area[1] * tube3.dx +
-                     tube4.area[1] * tube4.dx) * 0.5;
-
-        let j0 = Junction {
-            id: 0,
-            pos: [-0.7, 0.0],
-            connections: vec![
-                JunctionConnection { tube_id: 0, side: TubeSide::Right },
-                JunctionConnection { tube_id: 1, side: TubeSide::Left },
-                JunctionConnection { tube_id: 2, side: TubeSide::Left },
-                JunctionConnection { tube_id: 3, side: TubeSide::Left },
-                JunctionConnection { tube_id: 4, side: TubeSide::Left },
-            ],
-            rho: RHO_ATM,
-            e: P_ATM / (1.4 - 1.0),
-            volume: vol_0,
-            species: AIR_Y,
-            species_temp: AIR_Y,
+        let parse_bc = |bc_str: &str| -> BoundaryType {
+            if bc_str == "Closed" { return BoundaryType::Closed; }
+            if bc_str == "Open" { return BoundaryType::Open; }
+            if bc_str.starts_with("Valve:") {
+                let lift = bc_str.trim_start_matches("Valve:").parse::<f32>().unwrap_or(0.0);
+                return BoundaryType::Valve { lift };
+            }
+            BoundaryType::Closed
         };
 
-        // --- Junction 1 (Exhaust Collector) ---
-        let vol_1 = (tube5.area[tube5.num_cells] * tube5.dx +
-                     tube6.area[tube6.num_cells] * tube6.dx +
-                     tube7.area[tube7.num_cells] * tube7.dx +
-                     tube8.area[tube8.num_cells] * tube8.dx +
-                     tube9.area[1] * tube9.dx) * 0.5;
-
-        let j1 = Junction {
-            id: 1,
-            pos: [0.4, 0.0],
-            connections: vec![
-                JunctionConnection { tube_id: 5, side: TubeSide::Right },
-                JunctionConnection { tube_id: 6, side: TubeSide::Right },
-                JunctionConnection { tube_id: 7, side: TubeSide::Right },
-                JunctionConnection { tube_id: 8, side: TubeSide::Right },
-                JunctionConnection { tube_id: 9, side: TubeSide::Left },
-            ],
-            rho: RHO_ATM,
-            e: P_ATM / (1.4 - 1.0),
-            volume: vol_1,
-            species: AIR_Y,
-            species_temp: AIR_Y,
+        let parse_rp = |rp_str: &str| -> RadiusProfile {
+            if rp_str == "ExpansionChamber" { RadiusProfile::ExpansionChamber }
+            else { RadiusProfile::Linear }
         };
 
-        // --- Cylinders (ZX6R typical specs, loaded from config) ---
-        let bore = config.engine.bore;
-        let stroke = config.engine.stroke;
-        let conrod = config.engine.conrod_length;
-        let cr = config.engine.compression_ratio;
+        let mut tubes = Vec::new();
+        let mut junctions = Vec::new();
+        let mut cylinders = Vec::new();
 
-        // Firing order 1-3-4-2: offsets are 0, 3*PI, PI, 2*PI
-        let cyl1 = Cylinder::new(
-            0, bore, stroke, conrod, cr,
-            vec![
-                CylinderConnection { tube_id: 1, side: TubeSide::Right, valve_type: ValveType::Intake },
-                CylinderConnection { tube_id: 5, side: TubeSide::Left, valve_type: ValveType::Exhaust },
-            ]
-        ).with_offset(0.0);
+        if let Some(topo) = &config.topology {
+            for t in &topo.tubes {
+                tubes.push(Tube::new(
+                    t.id,
+                    t.name.clone(),
+                    t.num_cells,
+                    t.p0, t.p1, t.p2, t.p3,
+                    t.r_start, t.r_mid, t.r_end,
+                    parse_rp(&t.radius_profile),
+                    parse_bc(&t.left_bc),
+                    parse_bc(&t.right_bc),
+                ));
+            }
 
-        let cyl2 = Cylinder::new(
-            1, bore, stroke, conrod, cr,
-            vec![
-                CylinderConnection { tube_id: 2, side: TubeSide::Right, valve_type: ValveType::Intake },
-                CylinderConnection { tube_id: 6, side: TubeSide::Left, valve_type: ValveType::Exhaust },
-            ]
-        ).with_offset(3.0 * pi);
+            for j in &topo.junctions {
+                let mut connections = Vec::new();
+                let mut vol = 0.0;
+                for conn in &j.connections {
+                    let side = if conn.side == "Right" { TubeSide::Right } else { TubeSide::Left };
+                    connections.push(JunctionConnection { tube_id: conn.tube_id, side: side.clone() });
+                    
+                    // Approximate junction volume contribution
+                    if let Some(tube) = tubes.iter().find(|t| t.id == conn.tube_id) {
+                        let area = if side == TubeSide::Right { tube.area[tube.num_cells] } else { tube.area[1] };
+                        vol += area * tube.dx;
+                    }
+                }
+                vol *= 0.5; // Shared volume approximation
 
-        let cyl3 = Cylinder::new(
-            2, bore, stroke, conrod, cr,
-            vec![
-                CylinderConnection { tube_id: 3, side: TubeSide::Right, valve_type: ValveType::Intake },
-                CylinderConnection { tube_id: 7, side: TubeSide::Left, valve_type: ValveType::Exhaust },
-            ]
-        ).with_offset(1.0 * pi);
+                junctions.push(Junction {
+                    id: j.id,
+                    pos: j.pos,
+                    connections,
+                    rho: RHO_ATM,
+                    e: P_ATM / (1.4 - 1.0),
+                    volume: vol.max(1e-6),
+                    species: AIR_Y,
+                    species_temp: AIR_Y,
+                });
+            }
 
-        let cyl4 = Cylinder::new(
-            3, bore, stroke, conrod, cr,
-            vec![
-                CylinderConnection { tube_id: 4, side: TubeSide::Right, valve_type: ValveType::Intake },
-                CylinderConnection { tube_id: 8, side: TubeSide::Left, valve_type: ValveType::Exhaust },
-            ]
-        ).with_offset(2.0 * pi);
+            let bore = config.engine.bore;
+            let stroke = config.engine.stroke;
+            let conrod = config.engine.conrod_length;
+            let cr = config.engine.compression_ratio;
 
-        // Crankshaft with configuration parameters
+            for c in &topo.cylinders {
+                let mut connections = Vec::new();
+                for conn in &c.connections {
+                    let side = if conn.side == "Right" { TubeSide::Right } else { TubeSide::Left };
+                    let valve_type = if conn.valve_type == "Intake" { ValveType::Intake } else { ValveType::Exhaust };
+                    connections.push(CylinderConnection { tube_id: conn.tube_id, side, valve_type });
+                }
+                
+                let crank_offset_rad = c.crank_offset_deg * std::f32::consts::PI / 180.0;
+                cylinders.push(Cylinder::new(c.id, bore, stroke, conrod, cr, connections).with_offset(crank_offset_rad));
+            }
+        }
+
         let crankshaft = Crankshaft::new(config.engine.inertia, config.engine.viscous_friction);
 
-        let mut ecu = Ecu::new();
-        ecu.redline_rpm = config.ecu.redline_rpm;
-        ecu.target_idle_rpm = config.ecu.target_idle_rpm;
-        ecu.target_afr = config.ecu.target_afr;
-        ecu.manual_afr_control = config.ecu.manual_afr_control;
+        let ecu = Ecu::from_config(&config.ecu);
 
         let mut solver = Self {
-            tubes: vec![tube0, tube1, tube2, tube3, tube4, tube5, tube6, tube7, tube8, tube9],
-            junctions: vec![j0, j1],
+            tubes,
+            junctions,
             junctions_temp: Vec::new(),
             limiter: LimiterType::VanLeer,
             friction: config.engine.wall_friction,
@@ -999,9 +831,9 @@ impl Solver {
             t: 0.0,
             reflection_filter: 0.75,
             step_counter: 0,
-            cached_dt_stable: 0.0,
+            cached_dt_stable: 1e-6,
             crankshaft: Some(crankshaft),
-            cylinders: vec![cyl1, cyl2, cyl3, cyl4],
+            cylinders,
             ignition_on: true,
             ignition_timing_deg: config.ecu.ignition_timing_deg,
             target_afr: config.ecu.target_afr,
@@ -1016,6 +848,10 @@ impl Solver {
             misfire_model: crate::combustion::MisfireModel::new(),
             profile: SolverProfile::default(),
             initial_mass_flows: Vec::new(),
+            intake_valve_open_rad: config.engine.intake_valve_open_deg.to_radians(),
+            intake_valve_close_rad: config.engine.intake_valve_close_deg.to_radians(),
+            exhaust_valve_open_rad: config.engine.exhaust_valve_open_deg.to_radians(),
+            exhaust_valve_close_rad: config.engine.exhaust_valve_close_deg.to_radians(),
         };
         solver.update_connected_flags();
         solver
@@ -1068,6 +904,7 @@ impl Solver {
             if max_speed.is_nan() || max_speed.is_infinite() || max_speed <= 0.0 {
                 max_speed = 340.0;
             }
+            max_speed = max_speed.min(1200.0);
             self.cached_dt_stable = cfl * (min_dx / max_speed);
         }
         
@@ -1217,7 +1054,7 @@ impl Solver {
                 for cyl in &self.cylinders {
                     for conn in &cyl.connections {
                         if conn.valve_type == ValveType::Intake {
-                            let (open_a, close_a) = (350.0f32.to_radians(), 570.0f32.to_radians());
+                            let (open_a, close_a) = (self.intake_valve_open_rad, self.intake_valve_close_rad);
                             let lift = get_valve_lift(crank.theta + cyl.crank_pin_offset_radians, open_a, close_a);
                             if lift > 0.0 {
                                 let tube = &mut self.tubes[conn.tube_id];
@@ -1473,6 +1310,7 @@ impl Solver {
             crank_theta,
             gamma,
             filter_strength,
+            [self.intake_valve_open_rad, self.intake_valve_close_rad, self.exhaust_valve_open_rad, self.exhaust_valve_close_rad],
         );
         if let Some(t) = t_start_bc { t_bc += t.elapsed().as_micros() as f32; }
         
@@ -1649,6 +1487,7 @@ impl Solver {
             crank_theta,
             gamma,
             filter_strength,
+            [self.intake_valve_open_rad, self.intake_valve_close_rad, self.exhaust_valve_open_rad, self.exhaust_valve_close_rad],
         );
     }
 
@@ -1960,6 +1799,7 @@ impl Solver {
         crank_theta: Option<f32>,
         gamma: f32,
         filter_strength: f32,
+        valve_timings: [f32; 4],
     ) {
         // First call the standard network BC to set junctions and standard boundaries
         Self::apply_network_bc(tubes, junctions, use_temp, j_states, gamma, filter_strength);
@@ -1975,8 +1815,8 @@ impl Solver {
                 let m = tube.num_cells;
                 let lift = if let Some(theta) = crank_theta {
                     let (open_a, close_a) = match conn.valve_type {
-                        ValveType::Intake => (350.0f32.to_radians(), 570.0f32.to_radians()),
-                        ValveType::Exhaust => (140.0f32.to_radians(), 380.0f32.to_radians()),
+                        ValveType::Intake => (valve_timings[0], valve_timings[1]),
+                        ValveType::Exhaust => (valve_timings[2], valve_timings[3]),
                     };
                     get_valve_lift(theta + cyl.crank_pin_offset_radians, open_a, close_a)
                 } else {
@@ -2013,19 +1853,13 @@ impl Solver {
                                 tube.left_last_r_out,
                             );
                             
-                            if lift < 0.02 {
-                                let w_wall = [w1[0], -w1[1], w1[2]];
-                                let alpha = (lift - 1e-6) / (0.02 - 1e-6);
-                                let alpha = alpha.clamp(0.0, 1.0);
-                                w0 = lerp_primitive(w_wall, ghost, alpha);
-                                
-                                let c1 = (gamma * w1[2] / w1[0]).sqrt();
-                                let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
-                                new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
-                            } else {
-                                w0 = ghost;
-                                new_r_out = Some(r_out);
-                            }
+                            let w_wall = [w1[0], -w1[1], w1[2]];
+                            let alpha = lift.clamp(0.0, 1.0);
+                            w0 = lerp_primitive(w_wall, ghost, alpha);
+                            
+                            let c1 = (gamma * w1[2] / w1[0]).sqrt();
+                            let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
+                            new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
                         }
                         
                         let state = if use_temp { &mut tube.u_temp } else { &mut tube.u };
@@ -2063,19 +1897,13 @@ impl Solver {
                                 tube.right_last_r_out,
                             );
                             
-                            if lift < 0.02 {
-                                let w_wall = [wm[0], -wm[1], wm[2]];
-                                let alpha = (lift - 1e-6) / (0.02 - 1e-6);
-                                let alpha = alpha.clamp(0.0, 1.0);
-                                w_m1 = lerp_primitive(w_wall, ghost, alpha);
-                                
-                                let cm = (gamma * wm[2] / wm[0]).sqrt();
-                                let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
-                                new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
-                            } else {
-                                w_m1 = ghost;
-                                new_r_out = Some(r_out);
-                            }
+                            let w_wall = [wm[0], -wm[1], wm[2]];
+                            let alpha = lift.clamp(0.0, 1.0);
+                            w_m1 = lerp_primitive(w_wall, ghost, alpha);
+                            
+                            let cm = (gamma * wm[2] / wm[0]).sqrt();
+                            let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
+                            new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
                         }
                         
                         let state = if use_temp { &mut tube.u_temp } else { &mut tube.u };
@@ -2148,19 +1976,13 @@ impl Solver {
                             new_r_out = Some(r_wall);
                         } else {
                             let (ghost, r_out) = Self::open_left_ghost(w1, gamma, c_res, tube_filter, lift, tubes[k].left_last_r_out);
-                            if lift < 0.04 {
-                                let w_wall = [w1[0], -w1[1], w1[2]];
-                                let alpha = (lift - 1e-4) / (0.04 - 1e-4);
-                                let alpha = alpha.clamp(0.0, 1.0);
-                                w0 = lerp_primitive(w_wall, ghost, alpha);
-                                
-                                let c1 = (gamma * w1[2] / w1[0]).sqrt();
-                                let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
-                                new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
-                            } else {
-                                w0 = ghost;
-                                new_r_out = Some(r_out);
-                            }
+                            let w_wall = [w1[0], -w1[1], w1[2]];
+                            let alpha = lift.clamp(0.0, 1.0);
+                            w0 = lerp_primitive(w_wall, ghost, alpha);
+                            
+                            let c1 = (gamma * w1[2] / w1[0]).sqrt();
+                            let r_wall = -w1[1] + 2.0 * c1 / (gamma - 1.0);
+                            new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
                         }
                     }
                 }
@@ -2216,19 +2038,13 @@ impl Solver {
                             new_r_out = Some(r_wall);
                         } else {
                             let (ghost, r_out) = Self::open_right_ghost(wm, gamma, c_res, tube_filter, lift, tubes[k].right_last_r_out);
-                            if lift < 0.04 {
-                                let w_wall = [wm[0], -wm[1], wm[2]];
-                                let alpha = (lift - 1e-4) / (0.04 - 1e-4);
-                                let alpha = alpha.clamp(0.0, 1.0);
-                                w_m1 = lerp_primitive(w_wall, ghost, alpha);
-                                
-                                let cm = (gamma * wm[2] / wm[0]).sqrt();
-                                let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
-                                new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
-                            } else {
-                                w_m1 = ghost;
-                                new_r_out = Some(r_out);
-                            }
+                            let w_wall = [wm[0], -wm[1], wm[2]];
+                            let alpha = lift.clamp(0.0, 1.0);
+                            w_m1 = lerp_primitive(w_wall, ghost, alpha);
+                            
+                            let cm = (gamma * wm[2] / wm[0]).sqrt();
+                            let r_wall = wm[1] - 2.0 * cm / (gamma - 1.0);
+                            new_r_out = Some(alpha * r_out + (1.0 - alpha) * r_wall);
                         }
                     }
                 }

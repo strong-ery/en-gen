@@ -38,8 +38,8 @@ impl MisfireModel {
     /// * `residual_frac` — Y_CO2 + Y_exhaust mass fractions (0.0 to 1.0)
     /// * `lambda` — relative AFR (1.0 = stoichiometric)
     pub fn should_misfire(&mut self, residual_frac: f32, lambda: f32) -> bool {
-        // Base misfire probability increases from 0% at 15% residual to 100% at 60% residual
-        let mut prob = ((residual_frac - 0.15).max(0.0) / 0.45).clamp(0.0, 1.0);
+        // Base misfire probability increases from 0% at 22% residual to 100% at 67% residual
+        let mut prob = ((residual_frac - 0.22).max(0.0) / 0.45).clamp(0.0, 1.0);
 
         // Double probability penalty outside [0.8, 1.2] lambda range (rich/lean instability)
         if lambda < 0.8 || lambda > 1.2 {

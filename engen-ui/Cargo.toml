@@ -8,3 +8,4 @@ eframe = "0.28.1"
 egui_plot = "0.28.1"
 engen-core = { path = "../engen-core" }
 engen-audio = { path = "../engen-audio" }
+hound = "3.5.1"

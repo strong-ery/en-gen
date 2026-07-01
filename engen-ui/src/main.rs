@@ -135,7 +135,7 @@ fn spawn_solver_thread(
     _filter_params: Arc<Mutex<AudioFilterParams>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut solver = Solver::new_y_junction(); // default Y-junction preset
+        let mut solver = Solver::new_inline_four(); // load ZX6R from yaml
 
         // Write initial solver state back to UI
         {
@@ -149,7 +149,7 @@ fn spawn_solver_thread(
         let mut steps_timer = std::time::Instant::now();
         let mut last_ui_update = std::time::Instant::now();
         
-        let sim_dt = 1.0 / 64000.0; // 64kHz
+        let sim_dt = 1.0 / 40000.0; // 40kHz
         
         let mut local_jones_history = Vec::new();
         let mut local_audio_buf: Vec<f32> = Vec::with_capacity(128);
@@ -477,10 +477,10 @@ fn spawn_solver_thread(
                                         BoundaryType::Valve { lift } => lift,
                                         _ => -1.0,
                                     };
-                                    eprintln!(
-                                        "[DEBUG] throttle={:.3} tube0_left_lift={:.3} rpm={:.0} cyl_mass={:.6} cyl_p={:.0}",
-                                        state.throttle, lift, state.engine_rpm, cyl.mass, cyl.p
-                                    );
+                                    //eprintln!(
+                                    //    "[DEBUG] throttle={:.3} tube0_left_lift={:.3} rpm={:.0} cyl_mass={:.6} cyl_p={:.0}",
+                                    //    state.throttle, lift, state.engine_rpm, cyl.mass, cyl.p
+                                    //);
                                 }
                             }
                         } else {
@@ -798,6 +798,134 @@ impl eframe::App for EngenApp {
                             ui.checkbox(&mut self.ignition_on_input, "Ignition ON");
                             ui.checkbox(&mut self.audio_on_input, "Audio Output");
                         });
+
+                        let state_clone = Arc::clone(&self.shared_state);
+                        if ui.button("Render Test Audio (Inline 4)").clicked() {
+                            std::thread::spawn(move || {
+                                println!("Starting offline render...");
+                                let mut solver = engen_core::cfd::solver::Solver::new_inline_four();
+                                
+                                // Sync current UI parameters to the solver
+                                if let Ok(state) = state_clone.lock() {
+                                    for (k, tube) in solver.tubes.iter_mut().enumerate() {
+                                        if k < state.tubes.len() {
+                                            let ui_tube = &state.tubes[k];
+                                            tube.p0 = ui_tube.p0;
+                                            tube.p1 = ui_tube.p1;
+                                            tube.p2 = ui_tube.p2;
+                                            tube.p3 = ui_tube.p3;
+                                            tube.r_start = ui_tube.r_start;
+                                            tube.r_end = ui_tube.r_end;
+                                            tube.r_mid = ui_tube.r_mid;
+                                            tube.radius_profile = ui_tube.radius_profile;
+                                            tube.num_cells = ui_tube.num_cells;
+                                            tube.left_bc = ui_tube.left_bc;
+                                            tube.right_bc = ui_tube.right_bc;
+                                            tube.rebuild_geometry();
+                                            tube.reset_state();
+                                        }
+                                    }
+                                    
+                                    for (k, j) in solver.junctions.iter_mut().enumerate() {
+                                        if k < state.junctions.len() {
+                                            j.pos = state.junctions[k].pos;
+                                            
+                                            let mut vol = 0.0;
+                                            for conn in &j.connections {
+                                                let tube = &solver.tubes[conn.tube_id];
+                                                match conn.side {
+                                                    engen_core::cfd::solver::TubeSide::Left => vol += tube.area[1] * tube.dx,
+                                                    engen_core::cfd::solver::TubeSide::Right => vol += tube.area[tube.num_cells] * tube.dx,
+                                                }
+                                            }
+                                            j.volume = vol * 0.5;
+                                        }
+                                    }
+                                    solver.update_connected_flags();
+                                    solver.t = 0.0;
+                                    
+                                    solver.limiter = state.limiter;
+                                    solver.friction = state.friction;
+                                    solver.heat_transfer = state.heat_transfer;
+                                    
+                                    if let Some(ref mut crank) = solver.crankshaft {
+                                        crank.inertia = state.engine_inertia;
+                                        crank.friction_coeff = state.engine_friction;
+                                        // Start it off at the current RPM if desired, or at least idle.
+                                        let start_rpm = if state.engine_rpm > 500.0 { state.engine_rpm } else { 1500.0 };
+                                        crank.omega = (start_rpm * 2.0 * std::f32::consts::PI) / 60.0;
+                                    }
+                                    
+                                    if let Some(cyl) = solver.cylinders.first_mut() {
+                                        cyl.update_geometry(
+                                            state.engine_bore,
+                                            state.engine_stroke,
+                                            state.engine_conrod,
+                                            state.engine_compression_ratio,
+                                        );
+                                    }
+                                    
+                                    solver.ignition_timing_deg = state.ignition_timing_deg;
+                                    solver.target_afr = state.target_afr;
+                                    solver.ecu.target_afr = state.target_afr;
+                                    solver.ecu.ignition_timing_deg = state.ignition_timing_deg;
+                                }
+
+                                solver.ignition_on = true;
+                                let sim_dt = 1.0 / 40000.0;
+                                let downsample_ratio = 40000.0 / 44100.0;
+                                
+                                let total_time = 15.0;
+                                let num_sim_steps = (total_time * 40000.0) as usize;
+                                
+                                let spec = hound::WavSpec {
+                                    channels: 1,
+                                    sample_rate: 44100,
+                                    bits_per_sample: 16,
+                                    sample_format: hound::SampleFormat::Int,
+                                };
+                                let mut writer = hound::WavWriter::create("test_render.wav", spec).unwrap();
+                                
+                                let mut next_sample_t = 0.0;
+                                
+                                for step in 0..num_sim_steps {
+                                    let t = step as f32 * sim_dt;
+                                    
+                                    // Throttle schedule
+                                    let throttle = if t < 1.0 { 0.0 }
+                                        else if t < 3.0 { (t - 1.0) / 2.0 }
+                                        else if t < 5.0 { 1.0 }
+                                        else if t < 6.0 { 0.0 }
+                                        else if t < 6.2 { 0.7 }
+                                        else if t < 7.0 { 0.0 }
+                                        else if t < 7.3 { 0.8 }
+                                        else if t < 8.0 { 0.0 }
+                                        else if t < 9.0 { 0.9 }
+                                        else { 0.0 };
+                                        
+                                    solver.throttle_input = throttle;
+                                    
+                                    // Starter to get it running
+                                    if t < 0.5 {
+                                        solver.starter_active = true;
+                                    } else {
+                                        solver.starter_active = false;
+                                    }
+                                    
+                                    let jones_val = solver.step(sim_dt);
+                                    
+                                    if step as f64 >= next_sample_t {
+                                        let scaled = jones_val * 5.0e-2;
+                                        let sample_f32 = scaled / (1.0 + scaled.abs());
+                                        let sample_i16 = (sample_f32.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                                        writer.write_sample(sample_i16).unwrap();
+                                        next_sample_t += downsample_ratio;
+                                    }
+                                }
+                                writer.finalize().unwrap();
+                                println!("Offline render finished and saved to test_render.wav");
+                            });
+                        }
 
                         if has_engine {
                             ui.horizontal(|ui| {
@@ -1856,14 +1984,19 @@ fn main() -> eframe::Result<()> {
         }
     };
     
+    let config = match engen_core::config::FullConfig::load_from_file("config/engine_preset.yaml") {
+        Ok(c) => c,
+        Err(_) => engen_core::config::FullConfig::default()
+    };
+
     let default_fp = AudioFilterParams::default();
     let shared_state = Arc::new(Mutex::new(SharedState {
         tubes: Vec::new(),
         junctions: Vec::new(),
         time: 0.0,
         limiter: LimiterType::VanLeer,
-        friction: 0.025,
-        heat_transfer: 30.0,
+        friction: config.engine.wall_friction,
+        heat_transfer: config.engine.heat_transfer,
         speed_multiplier: 1.0,
         inject_pulse: false,
         pulse_amplitude: 20000.0,
@@ -1884,18 +2017,18 @@ fn main() -> eframe::Result<()> {
         cylinder_pressure: P_ATM,
         cylinder_volume: 0.0,
         cyl_pressure_histories: Vec::new(),
-        engine_bore: 0.052,
-        engine_stroke: 0.036,
-        engine_conrod: 0.072,
-        engine_compression_ratio: 10.0,
-        engine_inertia: 0.01,
-        engine_friction: 0.001,
+        engine_bore: config.engine.bore,
+        engine_stroke: config.engine.stroke,
+        engine_conrod: config.engine.conrod_length,
+        engine_compression_ratio: config.engine.compression_ratio,
+        engine_inertia: config.engine.inertia,
+        engine_friction: config.engine.viscous_friction,
         spin_rpm: 1200.0,
         trigger_spin: false,
         throttle: 1.0,
         ignition_on: true,
-        ignition_timing_deg: 15.0,
-        target_afr: 14.7,
+        ignition_timing_deg: config.ecu.ignition_timing_deg,
+        target_afr: config.ecu.target_afr,
         audio_on: true,
         starter_engaged: false,
         starter_timer: 0.0,
