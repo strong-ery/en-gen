@@ -154,6 +154,7 @@ fn spawn_solver_thread(
         let mut local_jones_history = Vec::new();
         let mut local_audio_buf: Vec<f32> = Vec::with_capacity(128);
         let mut debug_print_counter: u32 = 0;
+        let mut smoothed_audio: f32 = 0.0;
         
         loop {
             let mut inject = false;
@@ -391,12 +392,16 @@ fn spawn_solver_thread(
                     
                     let scaled_jones = jones_val * 5.0e-2;
                     let scaled = scaled_jones * audio_volume;
-                    let audio_sample = if state_audio_on && !scaled.is_nan() && !scaled.is_infinite() {
+                    let raw_sample = if state_audio_on && !scaled.is_nan() && !scaled.is_infinite() {
                         scaled / (1.0 + scaled.abs())
                     } else {
                         0.0
                     };
-                    local_audio_buf.push(audio_sample);
+                    
+                    // Simple 1-pole low-pass filter to destroy physics engine crackles
+                    smoothed_audio += (raw_sample - smoothed_audio) * 0.3;
+                    
+                    local_audio_buf.push(smoothed_audio);
                     
                     local_jones_history.push(scaled_jones);
                     if local_jones_history.len() > 4096 {

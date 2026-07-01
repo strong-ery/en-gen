@@ -423,6 +423,7 @@ pub struct Solver {
     pub ignition_timing_deg: f32,
     pub target_afr: f32,
     pub throttle_input: f32,
+    pub smoothed_throttle: f32,
     pub starter_active: bool,
     pub ecu: Ecu,
     
@@ -505,6 +506,7 @@ impl Solver {
             ignition_timing_deg: 15.0,
             target_afr: 14.7,
             throttle_input: 1.0,
+            smoothed_throttle: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
             last_cylinder_afr: 14.7,
@@ -614,6 +616,7 @@ impl Solver {
             ignition_timing_deg: 15.0,
             target_afr: 14.7,
             throttle_input: 1.0,
+            smoothed_throttle: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
             last_cylinder_afr: 14.7,
@@ -709,6 +712,7 @@ impl Solver {
             ignition_timing_deg: 15.0,
             target_afr: 14.7,
             throttle_input: 1.0,
+            smoothed_throttle: 1.0,
             starter_active: false,
             ecu: Ecu::new(),
             last_cylinder_afr: 14.7,
@@ -838,6 +842,7 @@ impl Solver {
             ignition_timing_deg: config.ecu.ignition_timing_deg,
             target_afr: config.ecu.target_afr,
             throttle_input: 1.0,
+            smoothed_throttle: 1.0,
             starter_active: false,
             ecu,
             last_cylinder_afr: config.ecu.target_afr,
@@ -904,11 +909,14 @@ impl Solver {
             if max_speed.is_nan() || max_speed.is_infinite() || max_speed <= 0.0 {
                 max_speed = 340.0;
             }
-            max_speed = max_speed.min(1200.0);
+            // Cap max_speed to 2000.0 to prevent n_steps from skyrocketing 
+            // and dropping the simulation below Real Time (RT < 1.0).
+            max_speed = max_speed.min(2000.0);
             self.cached_dt_stable = cfl * (min_dx / max_speed);
         }
         
         self.step_counter += 1;
+        self.t += dt;
         let dt_stable = self.cached_dt_stable;
         
         // Determine number of sub-steps
@@ -1011,9 +1019,11 @@ impl Solver {
             self.target_afr = self.ecu.target_afr;
             self.ignition_timing_deg = self.ecu.ignition_timing_deg;
 
-            // Set the intake boundary valve lift
+            // Set the intake boundary valve lift smoothly to prevent audio popping
+            let throttle_speed = 10.0; // 0 to 1.0 in 0.1 seconds
+            self.smoothed_throttle += (self.throttle_input - self.smoothed_throttle).clamp(-throttle_speed * dt, throttle_speed * dt);
             if !self.tubes.is_empty() {
-                let lift = (self.throttle_input + self.ecu.iac_lift).clamp(0.001, 1.0);
+                let lift = (self.smoothed_throttle + self.ecu.iac_lift).clamp(0.001, 1.0);
                 self.tubes[0].left_bc = BoundaryType::Valve { lift };
             }
         }
